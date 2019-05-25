@@ -141,7 +141,15 @@ func (pr *Peer) Dial(addr string) (*Conn, error) {
 }
 
 func Dial(addr string) (*Conn, error) {
-	pr := Listen("localhost:*")
+	lnAddr := ":*"
+	ipAndPort := strings.Split(addr, ":")
+	if len(ipAndPort) != 2 {
+		return nil, errIllegalAddr
+	}
+	if ipAndPort[0] == "127.0.0.1" || ipAndPort[0] == "localhost" {
+		lnAddr = "localhost" + lnAddr
+	}
+	pr := Listen(lnAddr)
 	return pr.Dial(addr)
 }
 
