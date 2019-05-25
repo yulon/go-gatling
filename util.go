@@ -28,6 +28,7 @@ var isReliableType = []bool{
 	true,  // pktRequestPorts
 	true,  // pktUpdatePorts
 	false, // pktClosed
+	false, // pktHeartbeat
 	true,  // pktStream
 }
 

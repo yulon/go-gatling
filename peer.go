@@ -40,11 +40,16 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 			lcPr:                   pr,
 			rmtIP:                  from.IP.String(),
 			rmtPortInfoMap:         map[uint16]*portInfo{},
-			rtt:                    int64(time.Second),
+			rtt:                    int64(500 * time.Millisecond),
 			reliableMap:            map[uint64]*reliableCache{},
 			recvReliableIDAppender: newIDAppender(nil),
 		}
 		con.setRmtPortInfos(portInfo{uint16(from.Port), to})
+		con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
+			for _, iad := range iads {
+				con.putRecvStrm(iad.data.([]byte), nil)
+			}
+		})
 
 		actual, loaded := pr.conMap.LoadOrStore(h.ID, con)
 		if !loaded {

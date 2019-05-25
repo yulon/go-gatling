@@ -44,6 +44,15 @@ func TestConn(*testing.T) {
 
 		fmt.Println("server send: 246")
 		con.Send([]byte("246"))
+
+		_, err = con.Read(data)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("server read:", string(data))
+
+		fmt.Println("server write: 000")
+		con.Write([]byte("000"))
 	}()
 
 	con, err := Dial("127.0.0.1:8828")
@@ -59,4 +68,13 @@ func TestConn(*testing.T) {
 		panic(err)
 	}
 	fmt.Println("client recv:", string(data))
+
+	fmt.Println("client write: 111")
+	con.Write([]byte("111"))
+
+	_, err = con.Read(data)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("client read:", string(data))
 }

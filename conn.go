@@ -100,14 +100,13 @@ func dial(pr *Peer, addr string) (*Conn, error) {
 		dialErrCh:              dialErrCh,
 		hasDialErrCh:           1,
 	}
-
+	con.setRmtPorts(uint16(port64))
 	con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
 		for _, iad := range iads {
 			con.putRecvStrm(iad.data.([]byte), nil)
 		}
 	})
 
-	con.setRmtPorts(uint16(port64))
 	pr.conMap.Store(id, con)
 	con.send(pktRequestPorts)
 
@@ -468,6 +467,32 @@ func (con *Conn) Recv() ([]byte, error) {
 		con.recvPktWaitCount++
 		con.recvPktCond.Wait()
 		con.recvPktWaitCount--
+	}
+}
+
+func (con *Conn) Write(b []byte) (int, error) {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	sz := 0
+	for {
+		if len(b) == 0 {
+			return sz, nil
+		}
+		var data []byte
+		if len(b) > 1024 {
+			data = b[:1024]
+			b = b[1024:]
+		} else {
+			data = b
+			b = nil
+		}
+		con.sendStrmPktCount++
+		err := con.sendUS(pktStream, con.sendStrmPktCount, data)
+		if err != nil {
+			return 0, err
+		}
+		sz += len(data)
 	}
 }
 
