@@ -16,6 +16,7 @@ const (
 	pktRequestPorts
 	pktUpdatePorts
 	pktClosed
+	pktInvalid
 	pktHeartbeat
 	pktStream
 )
@@ -27,7 +28,8 @@ var isReliableType = []bool{
 	false, // pktRequestReliables
 	true,  // pktRequestPorts
 	true,  // pktUpdatePorts
-	false, // pktClosed
+	true,  // pktClosed
+	false, // pktInvalid
 	false, // pktHeartbeat
 	true,  // pktStream
 }

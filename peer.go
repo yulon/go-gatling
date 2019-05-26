@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 )
 
 type Peer struct {
@@ -35,21 +34,8 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 	var con *Conn
 	v, ok := pr.conMap.Load(h.ID)
 	if !ok {
-		con = &Conn{
-			id:                     h.ID,
-			lcPr:                   pr,
-			rmtIP:                  from.IP.String(),
-			rmtPortInfoMap:         map[uint16]*portInfo{},
-			rtt:                    int64(500 * time.Millisecond),
-			reliableMap:            map[uint64]*reliableCache{},
-			recvReliableIDAppender: newIDAppender(nil),
-		}
-		con.setRmtPortInfos(portInfo{uint16(from.Port), to})
-		con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
-			for _, iad := range iads {
-				con.putRecvStrm(iad.data.([]byte), nil)
-			}
-		})
+		con = newConn(h.ID, pr, from.IP.String())
+		con.setRmtLimitedPort(uint16(from.Port), to)
 
 		actual, loaded := pr.conMap.LoadOrStore(h.ID, con)
 		if !loaded {
@@ -57,7 +43,7 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 				pr.acptCh <- con
 				return
 			}
-			h.Type = pktClosed
+			h.Type = pktInvalid
 			h.ReliableCount = 0
 			to.WriteToUDP(makePacket(&h), from)
 			return
@@ -65,7 +51,7 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 		con = actual.(*Conn)
 	} else {
 		con = v.(*Conn)
-		con.addRmtPortInfos(portInfo{uint16(from.Port), to})
+		con.setRmtLimitedPort(uint16(from.Port), to)
 	}
 	con.handleRecvPacket(&h, p[headerSz:])
 	return

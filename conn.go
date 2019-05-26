@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -20,7 +19,7 @@ type recvData struct {
 	doneCh chan bool
 }
 
-type portInfo struct {
+type portAndSender struct {
 	port      uint16
 	udpSender *net.UDPConn
 }
@@ -31,9 +30,9 @@ type Conn struct {
 	mtx  sync.Mutex
 
 	rmtIP          string
-	rmtPortInfos   []portInfo
-	rmtPortInfoMap map[uint16]*portInfo
+	rmtPorts       []uint16
 	rmtPortPtr     uint
+	rmtLimitedPort *portAndSender
 
 	rtt        int64
 	sendCount  int64
@@ -45,27 +44,41 @@ type Conn struct {
 
 	recvReliableIDAppender *idAppender
 
-	recvPktCache     [][]byte
-	recvPktErr       error
-	recvPktMtx       sync.Mutex
-	recvPktCond      *sync.Cond
-	recvPktWaitCount uint64
+	recvPktCache [][]byte
+	recvPktErr   error
+	recvPktMtx   sync.Mutex
+	recvPktCond  *sync.Cond
 
 	recvStrmIDAppender *idAppender
 	recvStrmBuf        []byte
 	recvStrmErr        error
 	recvStrmMtx        sync.Mutex
 	recvStrmCond       *sync.Cond
-	recvStrmWaitCount  uint64
 
 	sendStrmPktCount uint64
 
 	dialErrCh    chan error
 	hasDialErrCh uint32
 
-	isClosed       bool
-	closeCond      *sync.Cond
-	closeWaitCount uint64
+	isClosed  bool
+	closeCond *sync.Cond
+}
+
+func newConn(id uuid.UUID, pr *Peer, rmtIP string) *Conn {
+	con := &Conn{
+		id:                     id,
+		lcPr:                   pr,
+		rmtIP:                  rmtIP,
+		rtt:                    int64(500 * time.Millisecond),
+		reliableMap:            map[uint64]*reliableCache{},
+		recvReliableIDAppender: newIDAppender(nil),
+	}
+	con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
+		for _, iad := range iads {
+			con.putRecvStrm(iad.data.([]byte), nil)
+		}
+	})
+	return con
 }
 
 var errIllegalAddr = errors.New("gatling: Illegal address.")
@@ -89,23 +102,10 @@ func dial(pr *Peer, addr string) (*Conn, error) {
 
 	dialErrCh := make(chan error, 1)
 
-	con := &Conn{
-		id:                     id,
-		lcPr:                   pr,
-		rmtIP:                  ipAndPort[0],
-		rmtPortInfoMap:         map[uint16]*portInfo{},
-		rtt:                    int64(500 * time.Millisecond),
-		reliableMap:            map[uint64]*reliableCache{},
-		recvReliableIDAppender: newIDAppender(nil),
-		dialErrCh:              dialErrCh,
-		hasDialErrCh:           1,
-	}
+	con := newConn(id, pr, ipAndPort[0])
+	con.dialErrCh = dialErrCh
+	con.hasDialErrCh = 1
 	con.setRmtPorts(uint16(port64))
-	con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
-		for _, iad := range iads {
-			con.putRecvStrm(iad.data.([]byte), nil)
-		}
-	})
 
 	pr.conMap.Store(id, con)
 	con.send(pktRequestPorts)
@@ -132,31 +132,21 @@ func dial(pr *Peer, addr string) (*Conn, error) {
 
 func (con *Conn) close(isActive bool) error {
 	con.mtx.Lock()
+	defer con.mtx.Unlock()
 
 	if con.isClosed {
-		con.mtx.Unlock()
 		return errClosed
 	}
 
 	if isActive {
 		if con.closeCond != nil {
-			con.closeWaitCount++
 			con.closeCond.Wait()
-			con.closeWaitCount--
-			if con.closeWaitCount > 0 {
-				con.mtx.Unlock()
-				con.closeCond.Signal()
-			}
-			con.mtx.Unlock()
 			return nil
 		}
 		con.sendUS(pktClosed)
 		con.closeCond = sync.NewCond(&con.mtx)
-		con.closeWaitCount++
 		con.closeCond.Wait()
-		con.closeWaitCount--
 	} else if con.closeCond != nil {
-		con.mtx.Unlock()
 		return nil
 	}
 
@@ -166,11 +156,6 @@ func (con *Conn) close(isActive bool) error {
 	con.putRecvStrm(nil, errClosed)
 	con.isClosed = true
 
-	if con.closeWaitCount > 0 {
-		con.mtx.Unlock()
-		con.closeCond.Signal()
-	}
-	con.mtx.Unlock()
 	return nil
 }
 
@@ -178,33 +163,21 @@ func (con *Conn) Close() error {
 	return con.close(true)
 }
 
-func (con *Conn) lcPorts() []uint16 {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-	if con.lcPr == nil {
-		return nil
-	}
-	return con.lcPr.lnPorts
-}
-
-func (con *Conn) setRmtPortInfos(portInfos ...portInfo) {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-
-	con.rmtPortInfos = portInfos
-	for i := 0; i < len(con.rmtPortInfos); i++ {
-		con.rmtPortInfoMap[con.rmtPortInfos[i].port] = &con.rmtPortInfos[i]
-	}
-}
-
 func (con *Conn) setRmtPorts(ports ...uint16) {
-	portInfos := make([]portInfo, len(ports))
-	for i, port := range ports {
-		portInfos[i].port = port
-	}
-	con.setRmtPortInfos(portInfos...)
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	con.rmtPorts = ports
 }
 
+func (con *Conn) setRmtLimitedPort(port uint16, udpSender *net.UDPConn) {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	con.rmtLimitedPort = &portAndSender{port, udpSender}
+}
+
+/*
 func (con *Conn) addRmtPortInfos(portInfos ...portInfo) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
@@ -229,22 +202,28 @@ func (con *Conn) addRmtPorts(ports ...uint16) {
 	}
 	con.addRmtPortInfos(portInfos...)
 }
+*/
 
-func (con *Conn) rmtPortInfo() portInfo {
+func (con *Conn) rmtPort() uint16 {
 	con.rmtPortPtr++
-	return con.rmtPortInfos[int(con.rmtPortPtr%uint(len(con.rmtPortInfos)))]
+	return con.rmtPorts[int(con.rmtPortPtr%uint(len(con.rmtPorts)))]
 }
 
 func (con *Conn) rmtUDPAddrAndUDPSender() (*net.UDPAddr, *net.UDPConn, error) {
-	pi := con.rmtPortInfo()
-	udpAddr, err := net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(pi.port), 10))
+	var pas portAndSender
+
+	if con.rmtLimitedPort != nil {
+		pas = *con.rmtLimitedPort
+	} else {
+		pas.port = con.rmtPort()
+		pas.udpSender = con.lcPr.udpLnrs[con.lcPr.lnIx()]
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(pas.port), 10))
 	if err != nil {
 		return nil, nil, err
 	}
-	if pi.udpSender == nil {
-		return udpAddr, con.lcPr.udpLnrs[con.lcPr.lnIx()], nil
-	}
-	return udpAddr, pi.udpSender, nil
+	return udpAddr, pas.udpSender, nil
 }
 
 func (con *Conn) RTT() time.Duration {
@@ -326,7 +305,6 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 
 					_, err := con.writeUS(cache.data)
 					if err != nil {
-						fmt.Println("sender:", err)
 						con.mtx.Unlock()
 						return
 					}
@@ -396,9 +374,9 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 			}
 			delete(con.reliableMap, id)
 		}
-		if len(con.reliableMap) == 0 && con.closeCond != nil && con.closeWaitCount > 0 {
+		if len(con.reliableMap) == 0 && con.closeCond != nil {
 			con.mtx.Unlock()
-			con.closeCond.Signal()
+			con.closeCond.Broadcast()
 			return
 		}
 		con.mtx.Unlock()
@@ -418,6 +396,8 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 		}
 
 	case pktClosed:
+		fallthrough
+	case pktInvalid:
 		con.close(false)
 
 	case pktStream:
@@ -436,9 +416,9 @@ func (con *Conn) putRecvPkt(data []byte, err error) {
 	} else {
 		con.recvPktErr = err
 	}
-	if con.recvPktWaitCount > 0 {
+	if con.recvPktCond != nil {
 		con.recvPktMtx.Unlock()
-		con.recvPktCond.Signal()
+		con.recvPktCond.Broadcast()
 		return
 	}
 	con.recvPktMtx.Unlock()
@@ -446,27 +426,20 @@ func (con *Conn) putRecvPkt(data []byte, err error) {
 
 func (con *Conn) Recv() ([]byte, error) {
 	con.recvPktMtx.Lock()
+	defer con.recvPktMtx.Unlock()
+
 	for {
 		if len(con.recvPktCache) > 0 {
 			data := con.recvPktCache[0]
 			con.recvPktCache = con.recvPktCache[1:]
-			if con.recvPktWaitCount > 0 && len(con.recvPktCache) > 0 {
-				con.recvPktMtx.Unlock()
-				con.recvPktCond.Signal()
-			} else {
-				con.recvPktMtx.Unlock()
-			}
 			return data, nil
 		} else if con.recvPktErr != nil {
-			con.recvPktMtx.Unlock()
 			return nil, con.recvPktErr
 		}
 		if con.recvPktCond == nil {
 			con.recvPktCond = sync.NewCond(&con.recvPktMtx)
 		}
-		con.recvPktWaitCount++
 		con.recvPktCond.Wait()
-		con.recvPktWaitCount--
 	}
 }
 
@@ -503,9 +476,9 @@ func (con *Conn) putRecvStrm(data []byte, err error) {
 	} else {
 		con.recvStrmErr = err
 	}
-	if con.recvStrmWaitCount > 0 {
+	if con.recvStrmCond != nil {
 		con.recvStrmMtx.Unlock()
-		con.recvStrmCond.Signal()
+		con.recvStrmCond.Broadcast()
 		return
 	}
 	con.recvStrmMtx.Unlock()
@@ -513,18 +486,15 @@ func (con *Conn) putRecvStrm(data []byte, err error) {
 
 func (con *Conn) Read(b []byte) (int, error) {
 	con.recvStrmMtx.Lock()
+	defer con.recvStrmMtx.Unlock()
+
 	for {
 		if len(con.recvStrmBuf) > 0 {
 			sz := copy(b, con.recvStrmBuf)
 			if sz < len(con.recvStrmBuf) {
 				con.recvStrmBuf = con.recvStrmBuf[sz:]
-				if con.recvStrmWaitCount > 0 {
-					con.recvStrmMtx.Unlock()
-					con.recvStrmCond.Signal()
-				}
 			} else {
 				con.recvStrmBuf = nil
-				con.recvStrmMtx.Unlock()
 			}
 			return sz, nil
 		} else if con.recvStrmErr != nil {
@@ -534,8 +504,6 @@ func (con *Conn) Read(b []byte) (int, error) {
 		if con.recvStrmCond == nil {
 			con.recvStrmCond = sync.NewCond(&con.recvStrmMtx)
 		}
-		con.recvStrmWaitCount++
 		con.recvStrmCond.Wait()
-		con.recvStrmWaitCount--
 	}
 }
