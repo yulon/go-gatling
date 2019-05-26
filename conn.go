@@ -498,7 +498,6 @@ func (con *Conn) Read(b []byte) (int, error) {
 			}
 			return sz, nil
 		} else if con.recvStrmErr != nil {
-			con.recvStrmMtx.Unlock()
 			return 0, con.recvStrmErr
 		}
 		if con.recvStrmCond == nil {
