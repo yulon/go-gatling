@@ -63,6 +63,17 @@ type idAndData struct {
 	data interface{}
 }
 
+func newIDAndData(id uint64, data interface{}) idAndData {
+	switch data.(type) {
+	case []byte:
+		dataSrc := data.([]byte)
+		dataCpy := make([]byte, len(dataSrc))
+		copy(dataCpy, dataSrc)
+		return idAndData{id, dataCpy}
+	}
+	return idAndData{id, data}
+}
+
 type idAppender struct {
 	baseID    uint64
 	discretes []idAndData
@@ -89,7 +100,7 @@ func (ida *idAppender) TryAdd(id uint64, data interface{}) bool {
 		}
 		if id < iad.id {
 			a := ida.discretes[:i]
-			b := []idAndData{idAndData{id, data}}
+			b := []idAndData{newIDAndData(id, data)}
 			c := ida.discretes[i:]
 			ida.discretes = make([]idAndData, len(a)+len(b)+len(c))
 			copy(ida.discretes, a)
@@ -101,9 +112,9 @@ func (ida *idAppender) TryAdd(id uint64, data interface{}) bool {
 	}
 	if !isInst {
 		if len(ida.discretes) == 0 {
-			ida.discretes = []idAndData{idAndData{id, data}}
+			ida.discretes = []idAndData{newIDAndData(id, data)}
 		} else if id > ida.discretes[len(ida.discretes)-1].id {
-			ida.discretes = append(ida.discretes, idAndData{id, data})
+			ida.discretes = append(ida.discretes, newIDAndData(id, data))
 		}
 	}
 

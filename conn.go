@@ -377,8 +377,7 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 	switch h.Type {
 
 	case pktUnreliable:
-		con.putRecvPkt(other, nil)
-
+		fallthrough
 	case pktReliable:
 		con.putRecvPkt(other, nil)
 
