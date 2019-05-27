@@ -226,6 +226,26 @@ func (con *Conn) rmtUDPAddrAndUDPSender() (*net.UDPAddr, *net.UDPConn, error) {
 	return udpAddr, pas.udpSender, nil
 }
 
+func (con *Conn) LocalAddr() net.Addr {
+	return nil
+}
+
+func (con *Conn) RemoteAddr() net.Addr {
+	return nil
+}
+
+func (con *Conn) SetDeadline(t time.Time) error {
+	return nil
+}
+
+func (con *Conn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (con *Conn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
 func (con *Conn) RTT() time.Duration {
 	return time.Duration(atomic.LoadInt64(&con.rtt))
 }

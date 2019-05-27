@@ -139,7 +139,7 @@ func Dial(addr string) (*Conn, error) {
 	return pr.Dial(addr)
 }
 
-func (pr *Peer) Accept() (*Conn, error) {
+func (pr *Peer) AcceptGatling() (*Conn, error) {
 	con := <-pr.acptCh
 	con.handleRecvPacket(&header{
 		con.id,
@@ -147,4 +147,16 @@ func (pr *Peer) Accept() (*Conn, error) {
 		pktRequestPorts,
 	}, nil)
 	return con, nil
+}
+
+func (pr *Peer) Accept() (net.Conn, error) {
+	return pr.AcceptGatling()
+}
+
+func (pr *Peer) Addr() net.Addr {
+	return nil
+}
+
+func (pr *Peer) Close() error {
+	return nil
 }

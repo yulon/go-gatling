@@ -31,7 +31,7 @@ func TestConn(*testing.T) {
 		panic("444")
 	}
 	go func() {
-		con, err := pr.Accept()
+		con, err := pr.AcceptGatling()
 		if err != nil {
 			panic(err)
 		}
