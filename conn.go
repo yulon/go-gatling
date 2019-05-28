@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -38,9 +39,11 @@ type Conn struct {
 	sendCount  int64
 	lastSendTS time.Time
 
-	reliableCount        uint64
-	reliableMap          map[uint64]*reliableCache
-	reliableSenderCaller sync.Once
+	reliableCount            uint64
+	reliableCacheMap         map[uint64]*reliableCache
+	reliableCacheMapZeroCond *sync.Cond
+	reliablePreResendCount   uint64
+	reliableResenderCaller   sync.Once
 
 	recvReliableIDAppender *idAppender
 
@@ -65,12 +68,13 @@ type Conn struct {
 }
 
 func newConn(id uuid.UUID, pr *Peer, rmtIP string) *Conn {
+	pr.use()
 	con := &Conn{
 		id:                     id,
 		lcPr:                   pr,
 		rmtIP:                  rmtIP,
 		rtt:                    int64(500 * time.Millisecond),
-		reliableMap:            map[uint64]*reliableCache{},
+		reliableCacheMap:       map[uint64]*reliableCache{},
 		recvReliableIDAppender: newIDAppender(nil),
 	}
 	con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
@@ -112,28 +116,25 @@ func dial(pr *Peer, addr string) (*Conn, error) {
 
 	timeoutCh := make(chan bool, 1)
 	go func() {
-		time.Sleep(15 * time.Second)
+		time.Sleep(5 * time.Second)
 		timeoutCh <- true
 	}()
 
 	select {
 	case err = <-dialErrCh:
 		if err != nil {
-			pr.conMap.Delete(id)
+			con.closeUS(false)
 			return nil, err
 		}
 	case <-timeoutCh:
-		pr.conMap.Delete(id)
+		con.closeUS(false)
 		return nil, errTimeout
 	}
 
 	return con, nil
 }
 
-func (con *Conn) close(isActive bool) error {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-
+func (con *Conn) closeUS(isActive bool) error {
 	if con.isClosed {
 		return errClosed
 	}
@@ -151,12 +152,20 @@ func (con *Conn) close(isActive bool) error {
 	}
 
 	con.lcPr.conMap.Delete(con.id)
+	con.lcPr.unuse()
 
 	con.putRecvPkt(nil, errClosed)
 	con.putRecvStrm(nil, errClosed)
 	con.isClosed = true
 
 	return nil
+}
+
+func (con *Conn) close(isActive bool) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	return con.closeUS(isActive)
 }
 
 func (con *Conn) Close() error {
@@ -216,7 +225,11 @@ func (con *Conn) rmtUDPAddrAndUDPSender() (*net.UDPAddr, *net.UDPConn, error) {
 		pas = *con.rmtLimitedPort
 	} else {
 		pas.port = con.rmtPort()
-		pas.udpSender = con.lcPr.udpLnrs[con.lcPr.lnIx()]
+		var err error
+		pas.udpSender, err = con.lcPr.udpLnr()
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(pas.port), 10))
@@ -297,40 +310,59 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	p := makePacket(&h, others...)
 
 	if isReliable {
-		con.reliableMap[rc] = &reliableCache{
+		for len(con.reliableCacheMap) == reliableCacheMapSizeMax {
+			if con.reliableCacheMapZeroCond == nil {
+				con.reliableCacheMapZeroCond = sync.NewCond(&con.mtx)
+			}
+			con.reliablePreResendCount++
+			con.reliableCacheMapZeroCond.Wait()
+			con.reliablePreResendCount--
+		}
+		con.reliableCacheMap[rc] = &reliableCache{
 			time.Now(),
 			1,
 			p,
 		}
-		con.reliableSenderCaller.Do(func() {
+		con.reliableResenderCaller.Do(func() {
 			go func() {
 				for {
-					time.Sleep(con.RTT() * time.Duration(2))
-
 					con.mtx.Lock()
 
-					var cache *reliableCache
-					for _, cache = range con.reliableMap {
-						now := time.Now()
-						dRTT := con.RTT() * time.Duration(2)
+					caches := make([]*reliableCache, len(con.reliableCacheMap))
+
+					now := time.Now()
+					rtt := con.RTT()
+
+					c := 0
+					for _, cache := range con.reliableCacheMap {
 						dur := now.Sub(cache.ts)
-						if dur >= dRTT {
-							break
+						if dur <= rtt {
+							continue
 						}
+						caches[c] = cache
+						c++
 					}
-					if cache == nil {
-						con.mtx.Unlock()
+
+					con.mtx.Unlock()
+
+					if c == 0 {
+						time.Sleep(rtt)
 						continue
 					}
 
-					_, err := con.writeUS(cache.data)
-					if err != nil {
-						con.mtx.Unlock()
-						return
-					}
-					cache.sendCount++
+					for i := 0; i < c; i++ {
+						time.Sleep(rtt / time.Duration(c))
 
-					con.mtx.Unlock()
+						con.mtx.Lock()
+						_, err := con.writeUS(caches[i].data)
+						if err != nil {
+							con.mtx.Unlock()
+							fmt.Println("reliableResender", err)
+							return
+						}
+						caches[i].sendCount++
+						con.mtx.Unlock()
+					}
 				}
 			}()
 		})
@@ -384,21 +416,29 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 	case pktReceivedReliables:
 		ids := make([]uint64, len(other)/8)
 		binary.Read(bytes.NewReader(other), binary.LittleEndian, ids)
+
 		con.mtx.Lock()
-		for _, id := range ids {
-			cache, loaded := con.reliableMap[id]
-			if loaded {
-				atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(cache.ts)))
-				atomic.StoreInt64(&con.sendCount, cache.sendCount)
-			}
-			delete(con.reliableMap, id)
-		}
-		if len(con.reliableMap) == 0 && con.closeCond != nil {
-			con.mtx.Unlock()
-			con.closeCond.Broadcast()
+		defer con.mtx.Unlock()
+
+		if len(con.reliableCacheMap) == 0 {
 			return
 		}
-		con.mtx.Unlock()
+		for _, id := range ids {
+			cache, loaded := con.reliableCacheMap[id]
+			if !loaded {
+				continue
+			}
+			delete(con.reliableCacheMap, id)
+			atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(cache.ts)))
+			atomic.StoreInt64(&con.sendCount, cache.sendCount)
+		}
+		if con.reliablePreResendCount > 0 && len(con.reliableCacheMap) < reliableCacheMapSizeMax {
+			con.reliableCacheMapZeroCond.Broadcast()
+			return
+		}
+		if con.closeCond != nil && len(con.reliableCacheMap) == 0 {
+			con.closeCond.Broadcast()
+		}
 
 	case pktRequestReliables:
 

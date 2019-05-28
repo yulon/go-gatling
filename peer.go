@@ -12,16 +12,37 @@ import (
 )
 
 type Peer struct {
-	lnPorts []uint16
-	lnC     int
-	udpLnrs []*net.UDPConn
-	lnPtr   uintptr
-	conMap  sync.Map
-	acptCh  chan *Conn
+	lnPorts  []uint16
+	lnC      int
+	udpLnrs  []*net.UDPConn
+	lnPtr    uint
+	mtx      sync.Mutex
+	conMap   sync.Map
+	acptCh   chan *Conn
+	useCount int64
 }
 
-func (pr *Peer) lnIx() int {
-	return int(atomic.AddUintptr(&pr.lnPtr, 1) % uintptr(len(pr.lnPorts)))
+func (pr *Peer) use() {
+	atomic.AddInt64(&pr.useCount, int64(1))
+}
+
+func (pr *Peer) unuse() {
+	if atomic.AddInt64(&pr.useCount, -int64(1)) == 0 {
+		pr.Close()
+	}
+}
+
+func (pr *Peer) udpLnr() (*net.UDPConn, error) {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if len(pr.udpLnrs) == 0 {
+		return nil, errClosed
+	}
+
+	pr.lnPtr++
+	ix := int(pr.lnPtr % uint(len(pr.udpLnrs)))
+	return pr.udpLnrs[ix], nil
 }
 
 func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
@@ -46,6 +67,7 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 			h.Type = pktInvalid
 			h.ReliableCount = 0
 			to.WriteToUDP(makePacket(&h), from)
+			con.closeUS(false)
 			return
 		}
 		con = actual.(*Conn)
@@ -57,20 +79,22 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 	return
 }
 
-func listen(ip string, basePort uint16, portCount int) *Peer {
+func listen(ip string, basePort uint16, basePortIsHard bool, portCount int) (*Peer, error) {
 	pr := &Peer{
 		lnC:    portCount,
 		acptCh: make(chan *Conn, 1),
 	}
-
 	for i := 0; i < portCount; {
 		udpAddr, err := net.ResolveUDPAddr("udp", ip+":"+strconv.FormatUint(uint64(basePort), 10))
 		if err != nil {
-			return nil
+			return nil, err
 		}
 
 		udpLnr, err := net.ListenUDP("udp", udpAddr)
 		if err != nil {
+			if basePortIsHard {
+				return nil, err
+			}
 			basePort++
 			continue
 		}
@@ -93,14 +117,14 @@ func listen(ip string, basePort uint16, portCount int) *Peer {
 		i++
 		basePort++
 	}
-
-	return pr
+	pr.use()
+	return pr, nil
 }
 
-func Listen(addr string) *Peer {
+func Listen(addr string) (*Peer, error) {
 	ipAndPort := strings.Split(addr, ":")
 	if len(ipAndPort) != 2 {
-		return nil
+		return nil, errIllegalAddr
 	}
 
 	portCount := 1
@@ -110,16 +134,14 @@ func Listen(addr string) *Peer {
 		ipAndPort[1] = ipAndPort[1][:len(ipAndPort[1])-1]
 	}
 
-	var port uint16 = 10000
-	if ipAndPort[1] != "*" {
-		port64, err := strconv.ParseUint(ipAndPort[1], 10, 16)
-		if err != nil {
-			return nil
-		}
-		port = uint16(port64)
+	if ipAndPort[1] == "*" {
+		return listen(ipAndPort[0], uint16(10000), false, portCount)
 	}
-
-	return listen(ipAndPort[0], port, portCount)
+	port64, err := strconv.ParseUint(ipAndPort[1], 10, 16)
+	if err != nil {
+		return nil, err
+	}
+	return listen(ipAndPort[0], uint16(port64), true, portCount)
 }
 
 func (pr *Peer) Dial(addr string) (*Conn, error) {
@@ -135,8 +157,16 @@ func Dial(addr string) (*Conn, error) {
 	if ipAndPort[0] == "127.0.0.1" || ipAndPort[0] == "localhost" {
 		lnAddr = "localhost" + lnAddr
 	}
-	pr := Listen(lnAddr)
-	return pr.Dial(addr)
+	pr, err := Listen(lnAddr)
+	if err != nil {
+		return nil, err
+	}
+	con, err := pr.Dial(addr)
+	if err != nil {
+		return nil, err
+	}
+	pr.unuse()
+	return con, err
 }
 
 func (pr *Peer) AcceptGatling() (*Conn, error) {
@@ -154,9 +184,25 @@ func (pr *Peer) Accept() (net.Conn, error) {
 }
 
 func (pr *Peer) Addr() net.Addr {
-	return nil
+	udpLnr, err := pr.udpLnr()
+	if err != nil {
+		return nil
+	}
+	return udpLnr.LocalAddr()
 }
 
 func (pr *Peer) Close() error {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if len(pr.udpLnrs) == 0 {
+		return errClosed
+	}
+
+	for _, udpLnr := range pr.udpLnrs {
+		udpLnr.Close()
+	}
+	pr.udpLnrs = nil
+
 	return nil
 }

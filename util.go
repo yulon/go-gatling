@@ -42,6 +42,8 @@ type header struct {
 
 var headerSz = binary.Size(&header{})
 
+const reliableCacheMapSizeMax = 2048
+
 func makePacket(h *header, others ...interface{}) []byte {
 	buf := bytes.NewBuffer([]byte{})
 	binary.Write(buf, binary.LittleEndian, h)
