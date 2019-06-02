@@ -60,14 +60,14 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 
 		actual, loaded := pr.conMap.LoadOrStore(h.ID, con)
 		if !loaded {
-			if h.Type == pktRequestPorts && h.ReliableCount == 1 {
-				pr.acptCh <- con
+			if h.Type != pktRequestPorts || h.PktID != 1 {
+				h.Type = pktInvalid
+				h.PktID = 0
+				to.WriteToUDP(makePacket(&h), from)
+				con.closeUS(false)
 				return
 			}
-			h.Type = pktInvalid
-			h.ReliableCount = 0
-			to.WriteToUDP(makePacket(&h), from)
-			con.closeUS(false)
+			pr.acptCh <- con
 			return
 		}
 		con = actual.(*Conn)

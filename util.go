@@ -9,40 +9,54 @@ import (
 )
 
 const (
-	pktUnreliable byte = iota
-	pktReliable
-	pktReceivedReliables
-	pktRequestReliables
+	pktUnreliableData byte = iota
+	pktData
+	pktReceivedDatas
+	pktRequestDatas
 	pktRequestPorts
 	pktUpdatePorts
 	pktClosed
 	pktInvalid
 	pktHeartbeat
-	pktStream
+	pktStreamData
 )
 
 var isReliableType = []bool{
-	false, // pktUnreliable
-	true,  // pktReliable
-	false, // pktReceivedReliables
-	false, // pktRequestReliables
+	false, // pktUnreliableData
+	true,  // pktData
+	false, // pktReceivedDatas
+	false, // pktRequestDatas
 	true,  // pktRequestPorts
 	true,  // pktUpdatePorts
 	true,  // pktClosed
 	false, // pktInvalid
 	false, // pktHeartbeat
-	true,  // pktStream
+	true,  // pktStreamData
 }
 
 type header struct {
-	ID            uuid.UUID
-	ReliableCount uint64
-	Type          byte
+	ID    uuid.UUID
+	PktID uint64
+	Type  byte
 }
 
 var headerSz = binary.Size(&header{})
 
-const reliableCacheMapSizeMax = 2048
+const sendPktCachesMax = 1024
+
+func makeData(others ...interface{}) []byte {
+	buf := bytes.NewBuffer([]byte{})
+	for _, other := range others {
+		switch other.(type) {
+		case nil:
+		case []byte:
+			buf.Write(other.([]byte))
+		default:
+			binary.Write(buf, binary.LittleEndian, other)
+		}
+	}
+	return buf.Bytes()
+}
 
 func makePacket(h *header, others ...interface{}) []byte {
 	buf := bytes.NewBuffer([]byte{})

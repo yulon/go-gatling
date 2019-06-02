@@ -39,26 +39,29 @@ type Conn struct {
 	sendCount  int64
 	lastSendTS time.Time
 
-	reliableCount            uint64
-	reliableCacheMap         map[uint64]*reliableCache
-	reliableCacheMapZeroCond *sync.Cond
-	reliablePreResendCount   uint64
-	reliableResenderCaller   sync.Once
+	sendPktIDCount         uint64
+	sendPktCaches          []*sendPktCache
+	sendPktCacheMap        map[uint64]*sendPktCache
+	sendPktCachesNoMaxCond *sync.Cond
+	sendPktCachesValidCond *sync.Cond
+	preSendPktCount        uint64
+	sendPktSenderCaller    sync.Once
 
-	recvReliableIDAppender *idAppender
+	recvPktIDAppender *idAppender
 
 	recvPktCache [][]byte
 	recvPktErr   error
 	recvPktMtx   sync.Mutex
 	recvPktCond  *sync.Cond
 
+	sendStrmPktCount uint64
+	sendStrmMtx      sync.Mutex
+
 	recvStrmIDAppender *idAppender
 	recvStrmBuf        []byte
 	recvStrmErr        error
 	recvStrmMtx        sync.Mutex
 	recvStrmCond       *sync.Cond
-
-	sendStrmPktCount uint64
 
 	dialErrCh    chan error
 	hasDialErrCh uint32
@@ -70,12 +73,12 @@ type Conn struct {
 func newConn(id uuid.UUID, pr *Peer, rmtIP string) *Conn {
 	pr.use()
 	con := &Conn{
-		id:                     id,
-		lcPr:                   pr,
-		rmtIP:                  rmtIP,
-		rtt:                    int64(500 * time.Millisecond),
-		reliableCacheMap:       map[uint64]*reliableCache{},
-		recvReliableIDAppender: newIDAppender(nil),
+		id:                id,
+		lcPr:              pr,
+		rmtIP:             rmtIP,
+		rtt:               int64(500 * time.Millisecond),
+		sendPktCacheMap:   map[uint64]*sendPktCache{},
+		recvPktIDAppender: newIDAppender(nil),
 	}
 	con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
 		for _, iad := range iads {
@@ -114,19 +117,13 @@ func dial(pr *Peer, addr string) (*Conn, error) {
 	pr.conMap.Store(id, con)
 	con.send(pktRequestPorts)
 
-	timeoutCh := make(chan bool, 1)
-	go func() {
-		time.Sleep(5 * time.Second)
-		timeoutCh <- true
-	}()
-
 	select {
 	case err = <-dialErrCh:
 		if err != nil {
 			con.closeUS(false)
 			return nil, err
 		}
-	case <-timeoutCh:
+	case <-time.After(5 * time.Second):
 		con.closeUS(false)
 		return nil, errTimeout
 	}
@@ -287,88 +284,142 @@ func (con *Conn) write(b []byte) (int, error) {
 
 var errIntervalTooBrief = errors.New("gatling: Interval too brief.")
 
-type reliableCache struct {
-	ts        time.Time
-	sendCount int64
-	data      []byte
+type sendPktCache struct {
+	h           header
+	p           []byte
+	ix          int
+	firstSendTS time.Time
+	lastSendTS  time.Time
+	sendCount   int64
+	lossCount   int
+}
+
+func (con *Conn) sendCacheUS(spc *sendPktCache) error {
+	spc.lossCount = 0
+	spc.sendCount++
+	spc.lastSendTS = time.Now()
+	_, err := con.writeUS(spc.p)
+	return err
+}
+
+func (con *Conn) sendCache(spc *sendPktCache) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+	return con.sendCacheUS(spc)
 }
 
 func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	isReliable := isReliableType[typ]
 
-	var rc uint64
 	if isReliable {
-		rc = atomic.AddUint64(&con.reliableCount, 1)
-	} else {
-		rc = atomic.LoadUint64(&con.reliableCount)
+		con.sendPktIDCount++
 	}
+
 	h := header{
-		con.id,
-		rc,
-		typ,
+		ID:    con.id,
+		PktID: con.sendPktIDCount,
+		Type:  typ,
 	}
 	p := makePacket(&h, others...)
 
-	if isReliable {
-		for len(con.reliableCacheMap) == reliableCacheMapSizeMax {
-			if con.reliableCacheMapZeroCond == nil {
-				con.reliableCacheMapZeroCond = sync.NewCond(&con.mtx)
-			}
-			con.reliablePreResendCount++
-			con.reliableCacheMapZeroCond.Wait()
-			con.reliablePreResendCount--
-		}
-		con.reliableCacheMap[rc] = &reliableCache{
-			time.Now(),
-			1,
-			p,
-		}
-		con.reliableResenderCaller.Do(func() {
-			go func() {
-				for {
-					con.mtx.Lock()
-
-					caches := make([]*reliableCache, len(con.reliableCacheMap))
-
-					now := time.Now()
-					rtt := con.RTT()
-
-					c := 0
-					for _, cache := range con.reliableCacheMap {
-						dur := now.Sub(cache.ts)
-						if dur <= rtt {
-							continue
-						}
-						caches[c] = cache
-						c++
-					}
-
-					con.mtx.Unlock()
-
-					if c == 0 {
-						time.Sleep(rtt)
-						continue
-					}
-
-					for i := 0; i < c; i++ {
-						time.Sleep(rtt / time.Duration(c))
-
-						con.mtx.Lock()
-						_, err := con.writeUS(caches[i].data)
-						if err != nil {
-							con.mtx.Unlock()
-							fmt.Println("reliableResender", err)
-							return
-						}
-						caches[i].sendCount++
-						con.mtx.Unlock()
-					}
-				}
-			}()
-		})
+	if !isReliable {
+		_, err := con.writeUS(p)
+		return err
 	}
 
-	_, err := con.writeUS(p)
+	spc := &sendPktCache{
+		h: h,
+		p: p,
+	}
+	err := con.sendCacheUS(spc)
+	spc.firstSendTS = spc.lastSendTS
+	if err != nil {
+		return err
+	}
+
+	for len(con.sendPktCaches) == sendPktCachesMax {
+		if con.sendPktCachesNoMaxCond == nil {
+			con.sendPktCachesNoMaxCond = sync.NewCond(&con.mtx)
+		}
+		con.preSendPktCount++
+		con.sendPktCachesNoMaxCond.Wait()
+		con.preSendPktCount--
+	}
+
+	_, isExist := con.sendPktCacheMap[h.PktID]
+	if isExist {
+		delete(con.sendPktCacheMap, h.PktID)
+		return nil
+	}
+	con.sendPktCaches = append(con.sendPktCaches, spc)
+	spc.ix = len(con.sendPktCaches) - 1
+	con.sendPktCacheMap[h.PktID] = spc
+
+	if con.sendPktCachesValidCond != nil && len(con.sendPktCaches) == 1 {
+		con.mtx.Unlock()
+		con.sendPktCachesValidCond.Signal()
+		con.mtx.Lock()
+		return err
+	}
+
+	con.sendPktSenderCaller.Do(func() {
+		go func() {
+			for {
+				con.mtx.Lock()
+
+				if len(con.sendPktCaches) == 0 {
+					con.sendPktCachesValidCond = sync.NewCond(&con.mtx)
+					con.sendPktCachesValidCond.Wait()
+					con.sendPktCachesValidCond = nil
+				}
+
+				/*if spc := con.sendPktCaches[len(con.sendPktCaches)-1]; time.Now().Sub(spc.lastSendTS) > con.RTT() {
+					err := con.sendCacheUS(spc)
+					if err != nil {
+						con.mtx.Unlock()
+						fmt.Println("sendPktSender4:", err)
+						return
+					}
+				}*/
+
+				var timeoutSendPktCaches []*sendPktCache
+
+				for _, spc := range con.sendPktCaches {
+					now := time.Now()
+					/*if now.Sub(spc.firstSendTS) > 10*time.Second {
+						con.closeUS(false)
+						con.mtx.Unlock()
+						fmt.Println("sendPktSender3: send timeout", spc.h.PktID)
+						return
+					}*/
+					if now.Sub(spc.lastSendTS) > con.RTT() {
+						timeoutSendPktCaches = append(timeoutSendPktCaches, spc)
+						/*if len(timeoutSendPktCaches) >= 1024 {
+							break
+						}*/
+					}
+				}
+
+				con.mtx.Unlock()
+
+				if len(timeoutSendPktCaches) == 0 {
+					time.Sleep(con.RTT())
+					continue
+				}
+
+				for _, spc := range timeoutSendPktCaches {
+					time.Sleep(con.RTT() / time.Duration(len(timeoutSendPktCaches)))
+
+					err := con.sendCache(spc)
+					if err != nil {
+						fmt.Println("sendPktSender4:", err)
+						return
+					}
+				}
+			}
+		}()
+	})
+
 	return err
 }
 
@@ -379,11 +430,11 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 }
 
 func (con *Conn) UnreliableSend(data []byte) error {
-	return con.send(pktUnreliable, data)
+	return con.send(pktUnreliableData, data)
 }
 
 func (con *Conn) Send(data []byte) error {
-	return con.send(pktReliable, data)
+	return con.send(pktData, data)
 }
 
 func (con *Conn) Pace() error {
@@ -399,48 +450,90 @@ func (con *Conn) Pace() error {
 var errClosed = errors.New("gatling: Connection is closed.")
 
 func (con *Conn) handleRecvPacket(h *header, other []byte) {
-	if isReliableType[h.Type] && h.ReliableCount > 0 {
-		con.send(pktReceivedReliables, h.ReliableCount)
-		if !con.recvReliableIDAppender.TryAdd(h.ReliableCount, nil) {
+	if isReliableType[h.Type] && h.PktID > 0 {
+		con.send(pktReceivedDatas, h.PktID)
+		if !con.recvPktIDAppender.TryAdd(h.PktID, nil) {
 			return
 		}
 	}
 
 	switch h.Type {
 
-	case pktUnreliable:
+	case pktData:
 		fallthrough
-	case pktReliable:
+	case pktUnreliableData:
 		con.putRecvPkt(other, nil)
 
-	case pktReceivedReliables:
-		ids := make([]uint64, len(other)/8)
-		binary.Read(bytes.NewReader(other), binary.LittleEndian, ids)
+	case pktReceivedDatas:
+		pktIDs := make([]uint64, len(other)/8)
+		binary.Read(bytes.NewReader(other), binary.LittleEndian, pktIDs)
 
 		con.mtx.Lock()
-		defer con.mtx.Unlock()
 
-		if len(con.reliableCacheMap) == 0 {
-			return
-		}
-		for _, id := range ids {
-			cache, loaded := con.reliableCacheMap[id]
-			if !loaded {
+		for _, pktID := range pktIDs {
+			spc, isExist := con.sendPktCacheMap[pktID]
+			if !isExist {
+				con.sendPktCacheMap[pktID] = nil
 				continue
 			}
-			delete(con.reliableCacheMap, id)
-			atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(cache.ts)))
-			atomic.StoreInt64(&con.sendCount, cache.sendCount)
+			if spc == nil {
+				continue
+			}
+
+			atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(spc.firstSendTS)))
+			atomic.StoreInt64(&con.sendCount, spc.sendCount)
+
+			delete(con.sendPktCacheMap, pktID)
+
+			if spc.ix == len(con.sendPktCaches)-1 {
+				con.sendPktCaches = con.sendPktCaches[:spc.ix]
+				break
+			}
+			newSendPktCaches := make([]*sendPktCache, len(con.sendPktCaches)-1)
+			copy(newSendPktCaches, con.sendPktCaches[:spc.ix])
+			copy(newSendPktCaches[spc.ix:], con.sendPktCaches[spc.ix+1:])
+			for _, newSPC := range newSendPktCaches[spc.ix:] {
+				newSPC.ix--
+			}
+			con.sendPktCaches = newSendPktCaches
+
+			/*for i, spc := range con.sendPktCaches {
+				if spc.h.PktID == pktID {
+					//fmt.Println("rm", pktID)
+
+					atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(spc.firstSendTS)))
+					atomic.StoreInt64(&con.sendCount, spc.sendCount)
+
+					if i == len(con.sendPktCaches)-1 {
+						con.sendPktCaches = con.sendPktCaches[:i]
+						break
+					}
+					newSendPktSPCs := make([]*sendPktCache, len(con.sendPktCaches)-1)
+					copy(newSendPktSPCs, con.sendPktCaches[:i])
+					copy(newSendPktSPCs[i:], con.sendPktCaches[i+1:])
+					con.sendPktCaches = newSendPktSPCs
+					break
+				}
+				spc.lossCount++
+				if spc.lossCount > 2 {
+					fmt.Println("lossCount send", spc.h.PktID)
+					err := con.sendCacheUS(spc)
+					if err != nil {
+						con.mtx.Unlock()
+						return
+					}
+				}
+			}*/
 		}
-		if con.reliablePreResendCount > 0 && len(con.reliableCacheMap) < reliableCacheMapSizeMax {
-			con.reliableCacheMapZeroCond.Broadcast()
+		if con.preSendPktCount > 0 && len(con.sendPktCaches) < sendPktCachesMax {
+			con.mtx.Unlock()
+			con.sendPktCachesNoMaxCond.Broadcast()
 			return
 		}
-		if con.closeCond != nil && len(con.reliableCacheMap) == 0 {
-			con.closeCond.Broadcast()
-		}
 
-	case pktRequestReliables:
+		con.mtx.Unlock()
+
+	case pktRequestDatas:
 
 	case pktRequestPorts:
 		con.send(pktUpdatePorts, con.lcPr.lnPorts)
@@ -459,7 +552,7 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 	case pktInvalid:
 		con.close(false)
 
-	case pktStream:
+	case pktStreamData:
 		var strmPktID uint64
 		binary.Read(bytes.NewReader(other), binary.LittleEndian, &strmPktID)
 		con.recvStrmIDAppender.TryAdd(strmPktID, other[8:])
@@ -503,8 +596,8 @@ func (con *Conn) Recv() ([]byte, error) {
 }
 
 func (con *Conn) Write(b []byte) (int, error) {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
+	con.sendStrmMtx.Lock()
+	defer con.sendStrmMtx.Unlock()
 
 	sz := 0
 	for {
@@ -520,7 +613,7 @@ func (con *Conn) Write(b []byte) (int, error) {
 			b = nil
 		}
 		con.sendStrmPktCount++
-		err := con.sendUS(pktStream, con.sendStrmPktCount, data)
+		err := con.send(pktStreamData, con.sendStrmPktCount, data)
 		if err != nil {
 			return 0, err
 		}

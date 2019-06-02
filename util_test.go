@@ -26,9 +26,9 @@ func TestIDAppender(*testing.T) {
 }
 
 func TestConn(*testing.T) {
-	pr := Listen("localhost:8828+")
-	if pr == nil {
-		panic("444")
+	pr, err := Listen("localhost:8828+")
+	if err != nil {
+		panic(err)
 	}
 	go func() {
 		con, err := pr.AcceptGatling()
