@@ -33,6 +33,12 @@ func (pr *Peer) unuse() {
 }
 
 func (pr *Peer) udpLnr() (*net.UDPConn, error) {
+	/*if len(pr.udpLnrs) == 1 {
+		fmt.Println(pr.udpLnrs[0])
+		return pr.udpLnrs[0], nil
+	}
+	ix := int(atomic.AddUintptr(&pr.lnPtr, 1) % uintptr(len(pr.udpLnrs)))*/
+
 	pr.mtx.Lock()
 	defer pr.mtx.Unlock()
 
@@ -198,11 +204,9 @@ func (pr *Peer) Close() error {
 	if len(pr.udpLnrs) == 0 {
 		return errClosed
 	}
-
 	for _, udpLnr := range pr.udpLnrs {
 		udpLnr.Close()
 	}
 	pr.udpLnrs = nil
-
 	return nil
 }

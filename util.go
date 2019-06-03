@@ -94,16 +94,18 @@ type idAppender struct {
 	baseID    uint64
 	discretes []idAndData
 	onAppend  func([]idAndData)
-	mtx       sync.Mutex
+	mtx       *sync.Mutex
 }
 
-func newIDAppender(onAppend func([]idAndData)) *idAppender {
-	return &idAppender{onAppend: onAppend}
+func newIDAppender(mtx *sync.Mutex, onAppend func([]idAndData)) *idAppender {
+	return &idAppender{onAppend: onAppend, mtx: mtx}
 }
 
 func (ida *idAppender) TryAdd(id uint64, data interface{}) bool {
-	ida.mtx.Lock()
-	defer ida.mtx.Unlock()
+	if ida.mtx != nil {
+		ida.mtx.Lock()
+		defer ida.mtx.Unlock()
+	}
 
 	if id <= ida.baseID {
 		return false
@@ -147,4 +149,21 @@ func (ida *idAppender) TryAdd(id uint64, data interface{}) bool {
 	ida.baseID = ida.discretes[i-1].id
 	ida.discretes = ida.discretes[i:]
 	return true
+}
+
+func (ida *idAppender) Has(id uint64) bool {
+	if ida.mtx != nil {
+		ida.mtx.Lock()
+		defer ida.mtx.Unlock()
+	}
+
+	if id <= ida.baseID {
+		return true
+	}
+	for _, iad := range ida.discretes {
+		if id == iad.id {
+			return true
+		}
+	}
+	return false
 }

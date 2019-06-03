@@ -6,7 +6,7 @@ import (
 )
 
 func TestIDAppender(*testing.T) {
-	ida := newIDAppender(func(iads []idAndData) {
+	ida := newIDAppender(nil, func(iads []idAndData) {
 		for i, v := range iads {
 			if int(v.id) != i+1 {
 				panic("v.id != i")

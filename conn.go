@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -39,13 +38,12 @@ type Conn struct {
 	sendCount  int64
 	lastSendTS time.Time
 
-	sendPktIDCount         uint64
-	sendPktCaches          []*sendPktCache
-	sendPktCacheMap        map[uint64]*sendPktCache
-	sendPktCachesNoMaxCond *sync.Cond
-	sendPktCachesValidCond *sync.Cond
-	preSendPktCount        uint64
-	sendPktSenderCaller    sync.Once
+	sendPktIDCount           uint64
+	sendPktCaches            []*sendPktCache
+	sendPktIDAppender        *idAppender
+	sendPktCachesNoMaxCond   *sync.Cond
+	preSendPktCount          uint64
+	sendPktResenderIsRunning bool
 
 	recvPktIDAppender *idAppender
 
@@ -54,14 +52,15 @@ type Conn struct {
 	recvPktMtx   sync.Mutex
 	recvPktCond  *sync.Cond
 
-	sendStrmPktCount uint64
-	sendStrmMtx      sync.Mutex
+	wStrmPktCount uint64
+	wStrmMtx      sync.Mutex
 
-	recvStrmIDAppender *idAppender
-	recvStrmBuf        []byte
-	recvStrmErr        error
-	recvStrmMtx        sync.Mutex
-	recvStrmCond       *sync.Cond
+	rStrmIDAppender *idAppender
+	rStrmPkts       [][]byte
+	rStrmBuf        *bytes.Buffer
+	rStrmErr        error
+	rStrmMtx        sync.Mutex
+	rStrmCond       *sync.Cond
 
 	dialErrCh    chan error
 	hasDialErrCh uint32
@@ -73,18 +72,14 @@ type Conn struct {
 func newConn(id uuid.UUID, pr *Peer, rmtIP string) *Conn {
 	pr.use()
 	con := &Conn{
-		id:                id,
-		lcPr:              pr,
-		rmtIP:             rmtIP,
-		rtt:               int64(500 * time.Millisecond),
-		sendPktCacheMap:   map[uint64]*sendPktCache{},
-		recvPktIDAppender: newIDAppender(nil),
+		id:                       id,
+		lcPr:                     pr,
+		rmtIP:                    rmtIP,
+		rtt:                      int64(500 * time.Millisecond),
+		sendPktIDAppender:        newIDAppender(nil, nil),
+		sendPktResenderIsRunning: false,
+		recvPktIDAppender:        newIDAppender(&sync.Mutex{}, nil),
 	}
-	con.recvStrmIDAppender = newIDAppender(func(iads []idAndData) {
-		for _, iad := range iads {
-			con.putRecvStrm(iad.data.([]byte), nil)
-		}
-	})
 	return con
 }
 
@@ -152,7 +147,7 @@ func (con *Conn) closeUS(isActive bool) error {
 	con.lcPr.unuse()
 
 	con.putRecvPkt(nil, errClosed)
-	con.putRecvStrm(nil, errClosed)
+	con.putReadStrmPkt(0, nil, errClosed)
 	con.isClosed = true
 
 	return nil
@@ -215,18 +210,22 @@ func (con *Conn) rmtPort() uint16 {
 	return con.rmtPorts[int(con.rmtPortPtr%uint(len(con.rmtPorts)))]
 }
 
+var errRmtAddrLoss = errors.New("gatling: Remote address loss.")
+
 func (con *Conn) rmtUDPAddrAndUDPSender() (*net.UDPAddr, *net.UDPConn, error) {
 	var pas portAndSender
 
-	if con.rmtLimitedPort != nil {
-		pas = *con.rmtLimitedPort
-	} else {
+	if len(con.rmtPorts) > 0 {
 		pas.port = con.rmtPort()
 		var err error
 		pas.udpSender, err = con.lcPr.udpLnr()
 		if err != nil {
 			return nil, nil, err
 		}
+	} else if con.rmtLimitedPort != nil {
+		pas = *con.rmtLimitedPort
+	} else {
+		return nil, nil, errRmtAddrLoss
 	}
 
 	udpAddr, err := net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(pas.port), 10))
@@ -285,17 +284,14 @@ func (con *Conn) write(b []byte) (int, error) {
 var errIntervalTooBrief = errors.New("gatling: Interval too brief.")
 
 type sendPktCache struct {
-	h           header
+	id          uint64
 	p           []byte
-	ix          int
 	firstSendTS time.Time
 	lastSendTS  time.Time
 	sendCount   int64
-	lossCount   int
 }
 
 func (con *Conn) sendCacheUS(spc *sendPktCache) error {
-	spc.lossCount = 0
 	spc.sendCount++
 	spc.lastSendTS = time.Now()
 	_, err := con.writeUS(spc.p)
@@ -328,8 +324,8 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	}
 
 	spc := &sendPktCache{
-		h: h,
-		p: p,
+		id: h.PktID,
+		p:  p,
 	}
 	err := con.sendCacheUS(spc)
 	spc.firstSendTS = spc.lastSendTS
@@ -346,81 +342,73 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 		con.preSendPktCount--
 	}
 
-	_, isExist := con.sendPktCacheMap[h.PktID]
-	if isExist {
-		delete(con.sendPktCacheMap, h.PktID)
+	if con.sendPktIDAppender.Has(spc.id) {
 		return nil
 	}
 	con.sendPktCaches = append(con.sendPktCaches, spc)
-	spc.ix = len(con.sendPktCaches) - 1
-	con.sendPktCacheMap[h.PktID] = spc
 
-	if con.sendPktCachesValidCond != nil && len(con.sendPktCaches) == 1 {
-		con.mtx.Unlock()
-		con.sendPktCachesValidCond.Signal()
-		con.mtx.Lock()
-		return err
+	if con.sendPktResenderIsRunning {
+		return nil
 	}
 
-	con.sendPktSenderCaller.Do(func() {
-		go func() {
-			for {
-				con.mtx.Lock()
+	go func() {
+		for {
+			con.mtx.Lock()
 
-				if len(con.sendPktCaches) == 0 {
-					con.sendPktCachesValidCond = sync.NewCond(&con.mtx)
-					con.sendPktCachesValidCond.Wait()
-					con.sendPktCachesValidCond = nil
-				}
-
-				/*if spc := con.sendPktCaches[len(con.sendPktCaches)-1]; time.Now().Sub(spc.lastSendTS) > con.RTT() {
-					err := con.sendCacheUS(spc)
-					if err != nil {
-						con.mtx.Unlock()
-						fmt.Println("sendPktSender4:", err)
-						return
-					}
-				}*/
-
-				var timeoutSendPktCaches []*sendPktCache
-
-				for _, spc := range con.sendPktCaches {
-					now := time.Now()
-					/*if now.Sub(spc.firstSendTS) > 10*time.Second {
-						con.closeUS(false)
-						con.mtx.Unlock()
-						fmt.Println("sendPktSender3: send timeout", spc.h.PktID)
-						return
-					}*/
-					if now.Sub(spc.lastSendTS) > con.RTT() {
-						timeoutSendPktCaches = append(timeoutSendPktCaches, spc)
-						/*if len(timeoutSendPktCaches) >= 1024 {
-							break
-						}*/
-					}
-				}
-
+			if len(con.sendPktCaches) == 0 {
+				con.sendPktResenderIsRunning = false
 				con.mtx.Unlock()
+				return
+			}
 
-				if len(timeoutSendPktCaches) == 0 {
-					time.Sleep(con.RTT())
-					continue
+			/*if spc := con.sendPktCaches[len(con.sendPktCaches)-1]; time.Now().Sub(spc.lastSendTS) > con.RTT() {
+				err := con.sendCacheUS(spc)
+				if err != nil {
+					con.mtx.Unlock()
+					fmt.Println("sendPktSender4:", err)
+					return
 				}
+			}*/
 
-				for _, spc := range timeoutSendPktCaches {
-					time.Sleep(con.RTT() / time.Duration(len(timeoutSendPktCaches)))
+			var timeoutSendPktCaches []*sendPktCache
 
-					err := con.sendCache(spc)
-					if err != nil {
-						fmt.Println("sendPktSender4:", err)
-						return
-					}
+			for _, spc := range con.sendPktCaches {
+				now := time.Now()
+				/*if now.Sub(spc.firstSendTS) > 10*time.Second {
+					con.closeUS(false)
+					con.mtx.Unlock()
+					fmt.Println("sendPktSender3: send timeout", spc.h.PktID)
+					return
+				}*/
+				if now.Sub(spc.lastSendTS) > con.RTT() {
+					timeoutSendPktCaches = append(timeoutSendPktCaches, spc)
+					/*if len(timeoutSendPktCaches) >= 1024 {
+						break
+					}*/
 				}
 			}
-		}()
-	})
 
-	return err
+			con.mtx.Unlock()
+
+			if len(timeoutSendPktCaches) == 0 {
+				time.Sleep(con.RTT())
+				continue
+			}
+
+			for _, spc := range timeoutSendPktCaches {
+				time.Sleep(con.RTT() / time.Duration(len(timeoutSendPktCaches)))
+
+				err := con.sendCache(spc)
+				if err != nil {
+					return
+				}
+			}
+		}
+	}()
+
+	con.sendPktResenderIsRunning = true
+
+	return nil
 }
 
 func (con *Conn) send(typ byte, others ...interface{}) error {
@@ -471,34 +459,11 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 		con.mtx.Lock()
 
 		for _, pktID := range pktIDs {
-			spc, isExist := con.sendPktCacheMap[pktID]
-			if !isExist {
-				con.sendPktCacheMap[pktID] = nil
+			if !con.sendPktIDAppender.TryAdd(pktID, nil) {
 				continue
 			}
-			if spc == nil {
-				continue
-			}
-
-			atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(spc.firstSendTS)))
-			atomic.StoreInt64(&con.sendCount, spc.sendCount)
-
-			delete(con.sendPktCacheMap, pktID)
-
-			if spc.ix == len(con.sendPktCaches)-1 {
-				con.sendPktCaches = con.sendPktCaches[:spc.ix]
-				break
-			}
-			newSendPktCaches := make([]*sendPktCache, len(con.sendPktCaches)-1)
-			copy(newSendPktCaches, con.sendPktCaches[:spc.ix])
-			copy(newSendPktCaches[spc.ix:], con.sendPktCaches[spc.ix+1:])
-			for _, newSPC := range newSendPktCaches[spc.ix:] {
-				newSPC.ix--
-			}
-			con.sendPktCaches = newSendPktCaches
-
-			/*for i, spc := range con.sendPktCaches {
-				if spc.h.PktID == pktID {
+			for i, spc := range con.sendPktCaches {
+				if spc.id == pktID {
 					//fmt.Println("rm", pktID)
 
 					atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(spc.firstSendTS)))
@@ -514,7 +479,7 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 					con.sendPktCaches = newSendPktSPCs
 					break
 				}
-				spc.lossCount++
+				/*spc.lossCount++
 				if spc.lossCount > 2 {
 					fmt.Println("lossCount send", spc.h.PktID)
 					err := con.sendCacheUS(spc)
@@ -522,8 +487,8 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 						con.mtx.Unlock()
 						return
 					}
-				}
-			}*/
+				}*/
+			}
 		}
 		if con.preSendPktCount > 0 && len(con.sendPktCaches) < sendPktCachesMax {
 			con.mtx.Unlock()
@@ -553,9 +518,9 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 		con.close(false)
 
 	case pktStreamData:
-		var strmPktID uint64
-		binary.Read(bytes.NewReader(other), binary.LittleEndian, &strmPktID)
-		con.recvStrmIDAppender.TryAdd(strmPktID, other[8:])
+		var strmPktIx uint64
+		binary.Read(bytes.NewReader(other), binary.LittleEndian, &strmPktIx)
+		con.putReadStrmPkt(strmPktIx, other[8:], nil)
 	}
 }
 
@@ -596,8 +561,8 @@ func (con *Conn) Recv() ([]byte, error) {
 }
 
 func (con *Conn) Write(b []byte) (int, error) {
-	con.sendStrmMtx.Lock()
-	defer con.sendStrmMtx.Unlock()
+	con.wStrmMtx.Lock()
+	defer con.wStrmMtx.Unlock()
 
 	sz := 0
 	for {
@@ -612,8 +577,8 @@ func (con *Conn) Write(b []byte) (int, error) {
 			data = b
 			b = nil
 		}
-		con.sendStrmPktCount++
-		err := con.send(pktStreamData, con.sendStrmPktCount, data)
+		con.wStrmPktCount++
+		err := con.send(pktStreamData, con.wStrmPktCount, data)
 		if err != nil {
 			return 0, err
 		}
@@ -621,40 +586,49 @@ func (con *Conn) Write(b []byte) (int, error) {
 	}
 }
 
-func (con *Conn) putRecvStrm(data []byte, err error) {
-	con.recvStrmMtx.Lock()
+func (con *Conn) putReadStrmPkt(ix uint64, data []byte, err error) {
+	con.rStrmMtx.Lock()
 	if err == nil {
-		con.recvStrmBuf = append(con.recvStrmBuf, data...)
+		if con.rStrmBuf == nil {
+			con.rStrmBuf = bytes.NewBuffer([]byte{})
+			con.rStrmIDAppender = newIDAppender(nil, func(iads []idAndData) {
+				for _, iad := range iads {
+					con.rStrmBuf.Write(iad.data.([]byte))
+				}
+			})
+		}
+		if con.rStrmIDAppender.TryAdd(ix, data) == false {
+			con.rStrmMtx.Unlock()
+			panic("putReadStrmPkt: duplicate index")
+		}
 	} else {
-		con.recvStrmErr = err
+		con.rStrmErr = err
 	}
-	if con.recvStrmCond != nil {
-		con.recvStrmMtx.Unlock()
-		con.recvStrmCond.Broadcast()
+	if con.rStrmCond != nil {
+		con.rStrmMtx.Unlock()
+		con.rStrmCond.Broadcast()
 		return
 	}
-	con.recvStrmMtx.Unlock()
+	con.rStrmMtx.Unlock()
 }
 
 func (con *Conn) Read(b []byte) (int, error) {
-	con.recvStrmMtx.Lock()
-	defer con.recvStrmMtx.Unlock()
+	con.rStrmMtx.Lock()
+	defer con.rStrmMtx.Unlock()
 
 	for {
-		if len(con.recvStrmBuf) > 0 {
-			sz := copy(b, con.recvStrmBuf)
-			if sz < len(con.recvStrmBuf) {
-				con.recvStrmBuf = con.recvStrmBuf[sz:]
-			} else {
-				con.recvStrmBuf = nil
+		if con.rStrmBuf != nil && con.rStrmBuf.Len() > 0 {
+			sz, err := con.rStrmBuf.Read(b)
+			if err != nil {
+				panic(err)
 			}
 			return sz, nil
-		} else if con.recvStrmErr != nil {
-			return 0, con.recvStrmErr
+		} else if con.rStrmErr != nil {
+			return 0, con.rStrmErr
 		}
-		if con.recvStrmCond == nil {
-			con.recvStrmCond = sync.NewCond(&con.recvStrmMtx)
+		if con.rStrmCond == nil {
+			con.rStrmCond = sync.NewCond(&con.rStrmMtx)
 		}
-		con.recvStrmCond.Wait()
+		con.rStrmCond.Wait()
 	}
 }
