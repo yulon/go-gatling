@@ -52,7 +52,7 @@ func (pr *Peer) udpLnr() (*net.UDPConn, error) {
 }
 
 func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
-	r := bytes.NewReader(p)
+	r := bytes.NewBuffer(p)
 	var h header
 	err := binary.Read(r, binary.LittleEndian, &h)
 	if err != nil {
@@ -81,7 +81,7 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 		con = v.(*Conn)
 		con.setRmtLimitedPort(uint16(from.Port), to)
 	}
-	con.handleRecvPacket(&h, p[headerSz:])
+	con.handleRecvPacket(&h, r)
 	return
 }
 

@@ -34,9 +34,11 @@ type Conn struct {
 	rmtPortPtr     uint
 	rmtLimitedPort *portAndSender
 
-	rtt        int64
-	sendCount  int64
+	rtt       int64
+	sendCount int64
+
 	lastSendTS time.Time
+	lastRecvTS time.Time
 
 	sendPktIDCount           uint64
 	sendPktCaches            []*sendPktCache
@@ -115,11 +117,11 @@ func dial(pr *Peer, addr string) (*Conn, error) {
 	select {
 	case err = <-dialErrCh:
 		if err != nil {
-			con.closeUS(false)
+			con.close(false)
 			return nil, err
 		}
 	case <-time.After(5 * time.Second):
-		con.closeUS(false)
+		con.close(false)
 		return nil, errTimeout
 	}
 
@@ -293,8 +295,8 @@ type sendPktCache struct {
 
 func (con *Conn) sendCacheUS(spc *sendPktCache) error {
 	spc.sendCount++
-	spc.lastSendTS = time.Now()
 	_, err := con.writeUS(spc.p)
+	spc.lastSendTS = con.lastSendTS
 	return err
 }
 
@@ -435,11 +437,49 @@ func (con *Conn) Pace() error {
 	return con.sendUS(pktHeartbeat)
 }
 
+func (con *Conn) unresend(pktIDs ...uint64) {
+	con.mtx.Lock()
+
+	for _, pktID := range pktIDs {
+		if !con.sendPktIDAppender.TryAdd(pktID, nil) {
+			continue
+		}
+		for i, spc := range con.sendPktCaches {
+			if spc.id == pktID {
+				atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(spc.firstSendTS)))
+				atomic.StoreInt64(&con.sendCount, spc.sendCount)
+
+				if i == len(con.sendPktCaches)-1 {
+					con.sendPktCaches = con.sendPktCaches[:i]
+					break
+				}
+				newSendPktSPCs := make([]*sendPktCache, len(con.sendPktCaches)-1)
+				copy(newSendPktSPCs, con.sendPktCaches[:i])
+				copy(newSendPktSPCs[i:], con.sendPktCaches[i+1:])
+				con.sendPktCaches = newSendPktSPCs
+				break
+			}
+		}
+	}
+	if con.preSendPktCount > 0 && len(con.sendPktCaches) < sendPktCachesMax {
+		con.mtx.Unlock()
+		con.sendPktCachesNoMaxCond.Broadcast()
+		return
+	}
+
+	con.mtx.Unlock()
+}
+
 var errClosed = errors.New("gatling: Connection is closed.")
 
-func (con *Conn) handleRecvPacket(h *header, other []byte) {
+func (con *Conn) handleRecvPacket(h *header, r *bytes.Buffer) {
 	if isReliableType[h.Type] && h.PktID > 0 {
-		con.send(pktReceivedDatas, h.PktID)
+		if h.Type == pktRequestPorts {
+			con.send(pktResponsePorts, h.PktID, con.lcPr.lnPorts)
+			con.recvPktIDAppender.TryAdd(h.PktID, nil)
+			return
+		}
+		con.send(pktReceiveds, h.PktID)
 		if !con.recvPktIDAppender.TryAdd(h.PktID, nil) {
 			return
 		}
@@ -450,77 +490,44 @@ func (con *Conn) handleRecvPacket(h *header, other []byte) {
 	case pktData:
 		fallthrough
 	case pktUnreliableData:
-		con.putRecvPkt(other, nil)
+		con.putRecvPkt(r.Bytes(), nil)
 
-	case pktReceivedDatas:
-		pktIDs := make([]uint64, len(other)/8)
-		binary.Read(bytes.NewReader(other), binary.LittleEndian, pktIDs)
+	case pktReceiveds:
+		pktIDs := make([]uint64, r.Len()/8)
+		binary.Read(r, binary.LittleEndian, &pktIDs)
+		con.unresend(pktIDs...)
 
-		con.mtx.Lock()
+	case pktRequests:
 
-		for _, pktID := range pktIDs {
-			if !con.sendPktIDAppender.TryAdd(pktID, nil) {
-				continue
-			}
-			for i, spc := range con.sendPktCaches {
-				if spc.id == pktID {
-					//fmt.Println("rm", pktID)
+	case pktResponsePorts:
+		var reqPrtsPktID uint64
+		binary.Read(r, binary.LittleEndian, &reqPrtsPktID)
+		con.unresend(reqPrtsPktID)
 
-					atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(spc.firstSendTS)))
-					atomic.StoreInt64(&con.sendCount, spc.sendCount)
-
-					if i == len(con.sendPktCaches)-1 {
-						con.sendPktCaches = con.sendPktCaches[:i]
-						break
-					}
-					newSendPktSPCs := make([]*sendPktCache, len(con.sendPktCaches)-1)
-					copy(newSendPktSPCs, con.sendPktCaches[:i])
-					copy(newSendPktSPCs[i:], con.sendPktCaches[i+1:])
-					con.sendPktCaches = newSendPktSPCs
-					break
-				}
-				/*spc.lossCount++
-				if spc.lossCount > 2 {
-					fmt.Println("lossCount send", spc.h.PktID)
-					err := con.sendCacheUS(spc)
-					if err != nil {
-						con.mtx.Unlock()
-						return
-					}
-				}*/
-			}
-		}
-		if con.preSendPktCount > 0 && len(con.sendPktCaches) < sendPktCachesMax {
-			con.mtx.Unlock()
-			con.sendPktCachesNoMaxCond.Broadcast()
-			return
-		}
-
-		con.mtx.Unlock()
-
-	case pktRequestDatas:
-
-	case pktRequestPorts:
-		con.send(pktUpdatePorts, con.lcPr.lnPorts)
-
-	case pktUpdatePorts:
-		ports := make([]uint16, len(other)/2)
-		binary.Read(bytes.NewReader(other), binary.LittleEndian, ports)
+		ports := make([]uint16, r.Len()/2)
+		binary.Read(r, binary.LittleEndian, &ports)
 		con.setRmtPorts(ports...)
+
 		if atomic.SwapUint32(&con.hasDialErrCh, 0) == 1 {
 			con.dialErrCh <- nil
 			con.dialErrCh = nil
 		}
 
+	case pktUpdatePorts:
+		ports := make([]uint16, r.Len()/2)
+		binary.Read(r, binary.LittleEndian, &ports)
+		con.setRmtPorts(ports...)
+
 	case pktClosed:
 		fallthrough
+
 	case pktInvalid:
 		con.close(false)
 
 	case pktStreamData:
 		var strmPktIx uint64
-		binary.Read(bytes.NewReader(other), binary.LittleEndian, &strmPktIx)
-		con.putReadStrmPkt(strmPktIx, other[8:], nil)
+		binary.Read(r, binary.LittleEndian, &strmPktIx)
+		con.putReadStrmPkt(strmPktIx, r.Bytes(), nil)
 	}
 }
 

@@ -11,9 +11,10 @@ import (
 const (
 	pktUnreliableData byte = iota
 	pktData
-	pktReceivedDatas
-	pktRequestDatas
+	pktReceiveds
+	pktRequests
 	pktRequestPorts
+	pktResponsePorts
 	pktUpdatePorts
 	pktClosed
 	pktInvalid
@@ -24,9 +25,10 @@ const (
 var isReliableType = []bool{
 	false, // pktUnreliableData
 	true,  // pktData
-	false, // pktReceivedDatas
-	false, // pktRequestDatas
+	false, // pktReceiveds
+	false, // pktRequests
 	true,  // pktRequestPorts
+	false, // pktResponsePorts
 	true,  // pktUpdatePorts
 	true,  // pktClosed
 	false, // pktInvalid
