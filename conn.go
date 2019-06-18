@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -19,8 +20,8 @@ type recvData struct {
 	doneCh chan bool
 }
 
-type portAndSender struct {
-	port      uint16
+type addrAndSender struct {
+	udpAddr   *net.UDPAddr
 	udpSender *net.UDPConn
 }
 
@@ -29,23 +30,30 @@ type Conn struct {
 	lcPr *Peer
 	mtx  sync.Mutex
 
-	rmtIP          string
-	rmtPorts       []uint16
-	rmtPortPtr     uint
-	rmtLimitedPort *portAndSender
+	rmtIP             string
+	rmtPorts          []uint16
+	rmtPortPtr        uint
+	rmtLastOutputInfo *addrAndSender
 
-	rtt       int64
-	sendCount int64
+	nowRTT              int64
+	nowSentPktSendCount int64
+	minRTT              time.Duration
 
 	lastSendTS time.Time
 	lastRecvTS time.Time
 
 	sendPktIDCount           uint64
 	sendPktCaches            []*sendPktCache
-	sendPktIDAppender        *idAppender
 	sendPktCachesNoMaxCond   *sync.Cond
-	preSendPktCount          uint64
+	preResendPktCount        uint64
 	sendPktResenderIsRunning bool
+
+	sentPktIDAppender        *idAppender
+	sentPktIDBase            uint64
+	sentPktIDBaseRepeatCount int
+
+	someoneNoResendSentPktID uint64
+	someoneNoResendSentTS    time.Time
 
 	recvPktIDAppender *idAppender
 
@@ -73,12 +81,16 @@ type Conn struct {
 
 func newConn(id uuid.UUID, pr *Peer, rmtIP string) *Conn {
 	pr.use()
+	now := time.Now()
 	con := &Conn{
 		id:                       id,
 		lcPr:                     pr,
 		rmtIP:                    rmtIP,
-		rtt:                      int64(500 * time.Millisecond),
-		sendPktIDAppender:        newIDAppender(nil, nil),
+		nowRTT:                   int64(DefaultRTT),
+		minRTT:                   DefaultRTT,
+		lastSendTS:               now,
+		lastRecvTS:               now,
+		sentPktIDAppender:        newIDAppender(nil, nil),
 		sendPktResenderIsRunning: false,
 		recvPktIDAppender:        newIDAppender(&sync.Mutex{}, nil),
 	}
@@ -166,6 +178,13 @@ func (con *Conn) Close() error {
 	return con.close(true)
 }
 
+func (con *Conn) IsClose() bool {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	return con.isClosed
+}
+
 func (con *Conn) setRmtPorts(ports ...uint16) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
@@ -173,68 +192,62 @@ func (con *Conn) setRmtPorts(ports ...uint16) {
 	con.rmtPorts = ports
 }
 
-func (con *Conn) setRmtLimitedPort(port uint16, udpSender *net.UDPConn) {
+func (con *Conn) setRmtLastOutputInfo(udpAddr *net.UDPAddr, udpSender *net.UDPConn) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	con.rmtLimitedPort = &portAndSender{port, udpSender}
-}
+	con.lastRecvTS = time.Now()
 
-/*
-func (con *Conn) addRmtPortInfos(portInfos ...portInfo) {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-
-	for _, portInfo := range portInfos {
-		rmtPortInfoPtr, isExist := con.rmtPortInfoMap[portInfo.port]
-		if isExist {
-			if portInfo.udpSender == nil && rmtPortInfoPtr.udpSender != nil {
-				rmtPortInfoPtr.udpSender = nil
+	if con.rmtLastOutputInfo != nil {
+		if udpAddr.IP.Equal(con.rmtLastOutputInfo.udpAddr.IP) && udpAddr.Port == con.rmtLastOutputInfo.udpAddr.Port {
+			if udpSender != con.rmtLastOutputInfo.udpSender {
+				con.rmtLastOutputInfo.udpSender = nil
 			}
-			continue
+			return
 		}
-		con.rmtPortInfos = append(con.rmtPortInfos)
-		con.rmtPortInfoMap[portInfo.port] = &con.rmtPortInfos[len(con.rmtPortInfos)-1]
+		con.rmtLastOutputInfo.udpAddr = udpAddr
+		con.rmtLastOutputInfo.udpSender = udpSender
+		return
 	}
-}
 
-func (con *Conn) addRmtPorts(ports ...uint16) {
-	portInfos := make([]portInfo, len(ports))
-	for i, port := range ports {
-		portInfos[i].port = port
-	}
-	con.addRmtPortInfos(portInfos...)
-}
-*/
-
-func (con *Conn) rmtPort() uint16 {
-	con.rmtPortPtr++
-	return con.rmtPorts[int(con.rmtPortPtr%uint(len(con.rmtPorts)))]
+	con.rmtLastOutputInfo = &addrAndSender{udpAddr, udpSender}
 }
 
 var errRmtAddrLoss = errors.New("gatling: Remote address loss.")
 
-func (con *Conn) rmtUDPAddrAndUDPSender() (*net.UDPAddr, *net.UDPConn, error) {
-	var pas portAndSender
-
-	if len(con.rmtPorts) > 0 {
-		pas.port = con.rmtPort()
-		var err error
-		pas.udpSender, err = con.lcPr.udpLnr()
-		if err != nil {
-			return nil, nil, err
-		}
-	} else if con.rmtLimitedPort != nil {
-		pas = *con.rmtLimitedPort
+func (con *Conn) rmtUDPAddrAndUDPSenderUS() (udpAddr *net.UDPAddr, udpSender *net.UDPConn, err error) {
+	n := len(con.rmtPorts)
+	if con.rmtLastOutputInfo != nil {
+		n++
+	}
+	con.rmtPortPtr++
+	ix := int(con.rmtPortPtr % uint(n))
+	if ix == len(con.rmtPorts) {
+		udpAddr = con.rmtLastOutputInfo.udpAddr
+		udpSender = con.rmtLastOutputInfo.udpSender
 	} else {
-		return nil, nil, errRmtAddrLoss
+		udpAddr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
+		if err != nil {
+			return
+		}
 	}
 
-	udpAddr, err := net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(pas.port), 10))
-	if err != nil {
-		return nil, nil, err
-	}
-	return udpAddr, pas.udpSender, nil
+	/*n := len(con.rmtPorts)
+	if n > 0 {
+		con.rmtPortPtr++
+		ix := int(con.rmtPortPtr % uint(n))
+		udpAddr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
+		if err != nil {
+			return
+		}
+	} else if con.rmtLastOutputInfo != nil {
+		udpAddr = con.rmtLastOutputInfo.udpAddr
+		udpSender = con.rmtLastOutputInfo.udpSender
+	} else {
+		err = errRmtAddrLoss
+		return
+	}*/
+	return
 }
 
 func (con *Conn) LocalAddr() net.Addr {
@@ -257,30 +270,59 @@ func (con *Conn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
+func (con *Conn) ID() uuid.UUID {
+	return con.id
+}
+
 func (con *Conn) RTT() time.Duration {
-	return time.Duration(atomic.LoadInt64(&con.rtt))
+	return time.Duration(atomic.LoadInt64(&con.nowRTT))
 }
 
 func (con *Conn) PacketLoss() float32 {
-	return float32(1) - float32(1)/float32(atomic.LoadInt64(&con.sendCount))
+	return float32(1) - float32(1)/float32(atomic.LoadInt64(&con.nowSentPktSendCount))
 }
 
-func (con *Conn) writeUS(b []byte) (int, error) {
+func (con *Conn) LastRecvTS() time.Time {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+	return con.lastRecvTS
+}
+
+func (con *Conn) LastSendTS() time.Time {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+	return con.lastSendTS
+}
+
+func (con *Conn) LastActivityTS() time.Time {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	if con.lastRecvTS.Sub(con.lastSendTS) > 0 {
+		return con.lastRecvTS
+	}
+	return con.lastSendTS
+}
+
+func (con *Conn) writeUS(b []byte, count int) (int, error) {
 	if con.isClosed {
 		return 0, errClosed
 	}
-	udpAddr, udpSender, err := con.rmtUDPAddrAndUDPSender()
+	udpAddr, udpSender, err := con.rmtUDPAddrAndUDPSenderUS()
 	if err != nil {
 		return 0, err
 	}
 	con.lastSendTS = time.Now()
+	if udpSender == nil {
+		return con.lcPr.writeToUDP(b, udpAddr, count)
+	}
 	return udpSender.WriteToUDP(b, udpAddr)
 }
 
-func (con *Conn) write(b []byte) (int, error) {
+func (con *Conn) write(b []byte, count int) (int, error) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
-	return con.writeUS(b)
+	return con.writeUS(b, count)
 }
 
 var errIntervalTooBrief = errors.New("gatling: Interval too brief.")
@@ -293,17 +335,17 @@ type sendPktCache struct {
 	sendCount   int64
 }
 
-func (con *Conn) sendCacheUS(spc *sendPktCache) error {
+func (con *Conn) sendCacheUS(spc *sendPktCache, count int) error {
 	spc.sendCount++
-	_, err := con.writeUS(spc.p)
+	_, err := con.writeUS(spc.p, count)
 	spc.lastSendTS = con.lastSendTS
 	return err
 }
 
-func (con *Conn) sendCache(spc *sendPktCache) error {
+func (con *Conn) sendCache(spc *sendPktCache, count int) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
-	return con.sendCacheUS(spc)
+	return con.sendCacheUS(spc, count)
 }
 
 func (con *Conn) sendUS(typ byte, others ...interface{}) error {
@@ -321,7 +363,7 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	p := makePacket(&h, others...)
 
 	if !isReliable {
-		_, err := con.writeUS(p)
+		_, err := con.writeUS(p, 1)
 		return err
 	}
 
@@ -329,7 +371,7 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 		id: h.PktID,
 		p:  p,
 	}
-	err := con.sendCacheUS(spc)
+	err := con.sendCacheUS(spc, 1)
 	spc.firstSendTS = spc.lastSendTS
 	if err != nil {
 		return err
@@ -339,12 +381,16 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 		if con.sendPktCachesNoMaxCond == nil {
 			con.sendPktCachesNoMaxCond = sync.NewCond(&con.mtx)
 		}
-		con.preSendPktCount++
+		con.preResendPktCount++
 		con.sendPktCachesNoMaxCond.Wait()
-		con.preSendPktCount--
+		con.preResendPktCount--
 	}
 
-	if con.sendPktIDAppender.Has(spc.id) {
+	if con.sentPktIDAppender.Has(spc.id) {
+		if spc.id == con.someoneNoResendSentPktID {
+			con.updateRTTAndSPSCUS(con.someoneNoResendSentTS.Sub(spc.firstSendTS), 1)
+			con.someoneNoResendSentPktID = 0
+		}
 		return nil
 	}
 	con.sendPktCaches = append(con.sendPktCaches, spc)
@@ -363,44 +409,54 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 				return
 			}
 
-			/*if spc := con.sendPktCaches[len(con.sendPktCaches)-1]; time.Now().Sub(spc.lastSendTS) > con.RTT() {
-				err := con.sendCacheUS(spc)
-				if err != nil {
-					con.mtx.Unlock()
-					fmt.Println("sendPktSender4:", err)
-					return
-				}
-			}*/
-
 			var timeoutSendPktCaches []*sendPktCache
 
-			for _, spc := range con.sendPktCaches {
-				now := time.Now()
-				/*if now.Sub(spc.firstSendTS) > 10*time.Second {
+			now := time.Now()
+			minRTT := con.minRTT
+
+			for i := len(con.sendPktCaches) - 1; i >= 0; i-- {
+				spc := con.sendPktCaches[i]
+				if now.Sub(spc.lastSendTS) < minRTT {
+					continue
+				}
+				if now.Sub(spc.firstSendTS) > 30*time.Second {
 					con.closeUS(false)
 					con.mtx.Unlock()
-					fmt.Println("sendPktSender3: send timeout", spc.h.PktID)
+					fmt.Println("sendPktResender: send timeout", spc.id)
 					return
-				}*/
-				if now.Sub(spc.lastSendTS) > con.RTT() {
-					timeoutSendPktCaches = append(timeoutSendPktCaches, spc)
-					/*if len(timeoutSendPktCaches) >= 1024 {
-						break
-					}*/
 				}
+				err := con.sendCacheUS(spc, 3)
+				if err != nil {
+					con.mtx.Unlock()
+					return
+				}
+				break
 			}
+
+			/*for _, spc := range con.sendPktCaches {
+				if now.Sub(spc.firstSendTS) > 30*time.Second {
+					con.closeUS(false)
+					con.mtx.Unlock()
+					fmt.Println("sendPktResender: send timeout", spc.id)
+					return
+				}
+				if now.Sub(spc.lastSendTS) >= con.vRTT() {
+					timeoutSendPktCaches = append(timeoutSendPktCaches, spc)
+				}
+			}*/
 
 			con.mtx.Unlock()
 
 			if len(timeoutSendPktCaches) == 0 {
-				time.Sleep(con.RTT())
+				time.Sleep(minRTT)
 				continue
 			}
 
+			dur := minRTT / time.Duration(len(timeoutSendPktCaches))
 			for _, spc := range timeoutSendPktCaches {
-				time.Sleep(con.RTT() / time.Duration(len(timeoutSendPktCaches)))
+				time.Sleep(dur)
 
-				err := con.sendCache(spc)
+				err := con.sendCache(spc, 3)
 				if err != nil {
 					return
 				}
@@ -431,37 +487,75 @@ func (con *Conn) Pace() error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	if time.Now().Sub(con.lastSendTS.Add(con.RTT()*2)) > 0 {
+	if time.Now().Sub(con.lastSendTS.Add(con.minRTT)) <= 0 {
 		return errIntervalTooBrief
 	}
 	return con.sendUS(pktHeartbeat)
 }
 
+func (con *Conn) updateRTTAndSPSCUS(rtt time.Duration, sentPktSendCount int64) {
+	atomic.StoreInt64(&con.nowRTT, int64(rtt))
+	atomic.StoreInt64(&con.nowSentPktSendCount, sentPktSendCount)
+	if rtt < con.minRTT {
+		con.minRTT = rtt
+	}
+}
+
 func (con *Conn) unresend(pktIDs ...uint64) {
+	now := time.Now()
+
 	con.mtx.Lock()
 
+	isRms := false
 	for _, pktID := range pktIDs {
-		if !con.sendPktIDAppender.TryAdd(pktID, nil) {
+		if !con.sentPktIDAppender.TryAdd(pktID, nil) {
 			continue
 		}
+		isRm := false
 		for i, spc := range con.sendPktCaches {
 			if spc.id == pktID {
-				atomic.StoreInt64(&con.rtt, int64(time.Now().Sub(spc.firstSendTS)))
-				atomic.StoreInt64(&con.sendCount, spc.sendCount)
+				nowRTT := now.Sub(spc.firstSendTS)
+				con.updateRTTAndSPSCUS(nowRTT, spc.sendCount)
 
 				if i == len(con.sendPktCaches)-1 {
 					con.sendPktCaches = con.sendPktCaches[:i]
 					break
 				}
-				newSendPktSPCs := make([]*sendPktCache, len(con.sendPktCaches)-1)
-				copy(newSendPktSPCs, con.sendPktCaches[:i])
-				copy(newSendPktSPCs[i:], con.sendPktCaches[i+1:])
-				con.sendPktCaches = newSendPktSPCs
+				sendPktCacheRights := make([]*sendPktCache, len(con.sendPktCaches[i+1:]))
+				copy(sendPktCacheRights, con.sendPktCaches[i+1:])
+				con.sendPktCaches = con.sendPktCaches[:len(con.sendPktCaches)-1]
+				copy(con.sendPktCaches[i:], sendPktCacheRights)
+
+				isRm = true
+				isRms = true
 				break
 			}
 		}
+		if !isRm && con.someoneNoResendSentPktID == 0 {
+			con.someoneNoResendSentPktID = pktID
+			con.someoneNoResendSentTS = now
+		}
 	}
-	if con.preSendPktCount > 0 && len(con.sendPktCaches) < sendPktCachesMax {
+	if isRms {
+		if con.sentPktIDBase == con.sentPktIDAppender.baseID {
+			con.sentPktIDBaseRepeatCount++
+			if con.sentPktIDBaseRepeatCount > 2 {
+				con.sentPktIDBaseRepeatCount = 0
+				c := 0
+				for _, spc := range con.sendPktCaches {
+					if c > 31 {
+						break
+					}
+					con.sendCacheUS(spc, 1)
+					c++
+				}
+			}
+		} else {
+			con.sentPktIDBase = con.sentPktIDAppender.baseID
+			con.sentPktIDBaseRepeatCount = 0
+		}
+	}
+	if con.preResendPktCount > 0 && len(con.sendPktCaches) < sendPktCachesMax {
 		con.mtx.Unlock()
 		con.sendPktCachesNoMaxCond.Broadcast()
 		return

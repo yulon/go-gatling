@@ -20,6 +20,7 @@ type Peer struct {
 	conMap   sync.Map
 	acptCh   chan *Conn
 	useCount int64
+	isClosed bool
 }
 
 func (pr *Peer) use() {
@@ -32,23 +33,24 @@ func (pr *Peer) unuse() {
 	}
 }
 
-func (pr *Peer) udpLnr() (*net.UDPConn, error) {
-	/*if len(pr.udpLnrs) == 1 {
-		fmt.Println(pr.udpLnrs[0])
-		return pr.udpLnrs[0], nil
-	}
-	ix := int(atomic.AddUintptr(&pr.lnPtr, 1) % uintptr(len(pr.udpLnrs)))*/
-
+func (pr *Peer) writeToUDP(p []byte, udpAddr *net.UDPAddr, count int) (sz int, err error) {
 	pr.mtx.Lock()
 	defer pr.mtx.Unlock()
 
 	if len(pr.udpLnrs) == 0 {
-		return nil, errClosed
+		err = errClosed
+		return
 	}
 
-	pr.lnPtr++
-	ix := int(pr.lnPtr % uint(len(pr.udpLnrs)))
-	return pr.udpLnrs[ix], nil
+	for i := 0; i < count; i++ {
+		pr.lnPtr++
+		ix := int(pr.lnPtr % uint(len(pr.udpLnrs)))
+		sz, err = pr.udpLnrs[ix].WriteToUDP(p, udpAddr)
+		if err != nil {
+			return
+		}
+	}
+	return
 }
 
 func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
@@ -62,7 +64,7 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 	v, ok := pr.conMap.Load(h.ID)
 	if !ok {
 		con = newConn(h.ID, pr, from.IP.String())
-		con.setRmtLimitedPort(uint16(from.Port), to)
+		con.setRmtLastOutputInfo(from, to)
 
 		actual, loaded := pr.conMap.LoadOrStore(h.ID, con)
 		if !loaded {
@@ -79,7 +81,7 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 		con = actual.(*Conn)
 	} else {
 		con = v.(*Conn)
-		con.setRmtLimitedPort(uint16(from.Port), to)
+		con.setRmtLastOutputInfo(from, to)
 	}
 	con.handleRecvPacket(&h, r)
 	return
@@ -176,7 +178,10 @@ func Dial(addr string) (*Conn, error) {
 }
 
 func (pr *Peer) AcceptGatling() (*Conn, error) {
-	con := <-pr.acptCh
+	con, ok := <-pr.acptCh
+	if !ok || con.IsClose() {
+		return nil, errClosed
+	}
 	con.handleRecvPacket(&header{
 		con.id,
 		1,
@@ -190,11 +195,7 @@ func (pr *Peer) Accept() (net.Conn, error) {
 }
 
 func (pr *Peer) Addr() net.Addr {
-	udpLnr, err := pr.udpLnr()
-	if err != nil {
-		return nil
-	}
-	return udpLnr.LocalAddr()
+	return pr.udpLnrs[0].LocalAddr()
 }
 
 func (pr *Peer) Close() error {
@@ -204,9 +205,16 @@ func (pr *Peer) Close() error {
 	if len(pr.udpLnrs) == 0 {
 		return errClosed
 	}
+	close(pr.acptCh)
 	for _, udpLnr := range pr.udpLnrs {
 		udpLnr.Close()
 	}
 	pr.udpLnrs = nil
 	return nil
+}
+
+func (pr *Peer) Range(f func(con *Conn) bool) {
+	pr.conMap.Range(func(_, v interface{}) bool {
+		return f(v.(*Conn))
+	})
 }

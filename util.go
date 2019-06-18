@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -45,6 +46,8 @@ type header struct {
 var headerSz = binary.Size(&header{})
 
 const sendPktCachesMax = 1024
+
+const DefaultRTT = 266 * time.Millisecond
 
 func makeData(others ...interface{}) []byte {
 	buf := bytes.NewBuffer([]byte{})
