@@ -72,7 +72,7 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 				h.Type = pktInvalid
 				h.PktID = 0
 				to.WriteToUDP(makePacket(&h), from)
-				con.closeUS(false)
+				con.closeUS(errClosed)
 				return
 			}
 			pr.acptCh <- con
