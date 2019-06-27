@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,10 +27,8 @@ type Conn struct {
 	lcPr *Peer
 	mtx  sync.Mutex
 
-	rmtIP             string
-	rmtPorts          []uint16
-	rmtPortPtr        uint
-	rmtLastOutputInfo *sendInfo
+	sendInfos  []*sendInfo
+	sendInfoIx uint
 
 	nowRTT              int64
 	nowSentPktSendCount int64
@@ -77,13 +74,12 @@ type Conn struct {
 	closeStatus byte
 }
 
-func newConn(id uuid.UUID, pr *Peer, rmtIP string) *Conn {
+func newConn(id uuid.UUID, pr *Peer) *Conn {
 	pr.use()
 	now := time.Now()
 	con := &Conn{
 		id:                       id,
 		lcPr:                     pr,
-		rmtIP:                    rmtIP,
 		nowRTT:                   int64(DefaultRTT),
 		minRTT:                   DefaultRTT,
 		lastSendTS:               now,
@@ -160,14 +156,26 @@ func (con *Conn) IsClose() bool {
 	return con.closeStatus > 0
 }
 
-func (con *Conn) setRmtPorts(ports ...uint16) {
+func (con *Conn) setRmtAddr(mainAddr net.Addr, ports ...uint16) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	con.rmtPorts = ports
+	mainUDPAddr := mainAddr.(*net.UDPAddr)
+	con.sendInfos = []*sendInfo{&sendInfo{mainUDPAddr, nil}}
+
+	for _, port := range ports {
+		if port == uint16(mainUDPAddr.Port) {
+			continue
+		}
+		con.sendInfos = append(con.sendInfos, &sendInfo{&net.UDPAddr{
+			IP:   mainUDPAddr.IP,
+			Port: int(port),
+			Zone: mainUDPAddr.Zone,
+		}, nil})
+	}
 }
 
-func (con *Conn) setRecvInfo(from net.Addr, to net.PacketConn) {
+func (con *Conn) handleRecvInfo(from net.Addr, to net.PacketConn) {
 	udpAddr := from.(*net.UDPAddr)
 
 	con.mtx.Lock()
@@ -175,58 +183,19 @@ func (con *Conn) setRecvInfo(from net.Addr, to net.PacketConn) {
 
 	con.lastRecvTS = time.Now()
 
-	if con.rmtLastOutputInfo != nil {
-		if udpAddr.IP.Equal(con.rmtLastOutputInfo.addr.(*net.UDPAddr).IP) &&
-			udpAddr.Port == con.rmtLastOutputInfo.addr.(*net.UDPAddr).Port {
-			if to != con.rmtLastOutputInfo.sender {
-				con.rmtLastOutputInfo.sender = nil
+	for _, si := range con.sendInfos {
+		siUDPAddr := si.addr.(*net.UDPAddr)
+		if udpAddr.IP.Equal(siUDPAddr.IP) && udpAddr.Port == siUDPAddr.Port {
+			if si.sender != nil && si.sender != to {
+				si.sender = to
 			}
 			return
 		}
-		con.rmtLastOutputInfo.addr = from
-		con.rmtLastOutputInfo.sender = to
-		return
 	}
-
-	con.rmtLastOutputInfo = &sendInfo{from, to}
+	con.sendInfos = append(con.sendInfos, &sendInfo{from, to})
 }
 
 var errRmtAddrLoss = errors.New("gatling: Remote address loss.")
-
-func (con *Conn) rmtUDPAddrAndUDPSenderUS() (addr net.Addr, sender net.PacketConn, err error) {
-	n := len(con.rmtPorts)
-	if con.rmtLastOutputInfo != nil {
-		n++
-	}
-	con.rmtPortPtr++
-	ix := int(con.rmtPortPtr % uint(n))
-	if ix == len(con.rmtPorts) {
-		addr = con.rmtLastOutputInfo.addr
-		sender = con.rmtLastOutputInfo.sender
-	} else {
-		addr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
-		if err != nil {
-			return
-		}
-	}
-
-	/*n := len(con.rmtPorts)
-	if n > 0 {
-		con.rmtPortPtr++
-		ix := int(con.rmtPortPtr % uint(n))
-		addr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
-		if err != nil {
-			return
-		}
-	} else if con.rmtLastOutputInfo != nil {
-		addr = con.rmtLastOutputInfo.addr
-		sender = con.rmtLastOutputInfo.sender
-	} else {
-		err = errRmtAddrLoss
-		return
-	}*/
-	return
-}
 
 func (con *Conn) LocalAddr() net.Addr {
 	return nil
@@ -302,17 +271,18 @@ func (con *Conn) writeUS(b []byte, count int) (int, error) {
 	if con.closeStatus > 1 {
 		return 0, errClosed
 	}
-	addr, sender, err := con.rmtUDPAddrAndUDPSenderUS()
-	if err != nil {
-		con.closeUS(err)
-		return 0, err
-	}
+
+	con.sendInfoIx++
+	ix := int(con.sendInfoIx % uint(len(con.sendInfos)))
+	sendInfo := con.sendInfos[ix]
+
 	var sz int
+	var err error
 	con.lastSendTS = time.Now()
-	if sender == nil {
-		sz, err = con.lcPr.writeTo(b, addr, count)
+	if sendInfo.sender == nil {
+		sz, err = con.lcPr.writeTo(b, sendInfo.addr, count)
 	} else {
-		sz, err = sender.WriteTo(b, addr)
+		sz, err = sendInfo.sender.WriteTo(b, sendInfo.addr)
 	}
 	if err != nil {
 		con.closeUS(err)
@@ -613,7 +583,7 @@ func (con *Conn) unresend(pktIDs ...uint64) {
 
 var errClosed = errors.New("gatling: Connection is closed.")
 
-func (con *Conn) handleRecvPacket(h *header, r *bytes.Buffer) {
+func (con *Conn) handleRecvPacket(from net.Addr, h *header, r *bytes.Buffer) {
 	if isReliableType[h.Type] && h.PktID > 0 {
 		if h.Type == pktRequestPorts {
 			con.send(pktResponsePorts, h.PktID, con.lcPr.lnPorts)
@@ -647,12 +617,12 @@ func (con *Conn) handleRecvPacket(h *header, r *bytes.Buffer) {
 
 		ports := make([]uint16, r.Len()/2)
 		binary.Read(r, binary.LittleEndian, &ports)
-		con.setRmtPorts(ports...)
+		con.setRmtAddr(from, ports...)
 
 	case pktUpdatePorts:
 		ports := make([]uint16, r.Len()/2)
 		binary.Read(r, binary.LittleEndian, &ports)
-		con.setRmtPorts(ports...)
+		con.setRmtAddr(from, ports...)
 
 	case pktClosed:
 		fallthrough

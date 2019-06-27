@@ -65,8 +65,8 @@ func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, p []byte) {
 	var con *Conn
 	v, ok := pr.conMap.Load(h.ID)
 	if !ok {
-		con = newConn(h.ID, pr, from.(*net.UDPAddr).IP.String())
-		con.setRecvInfo(from, to)
+		con = newConn(h.ID, pr)
+		con.handleRecvInfo(from, to)
 
 		actual, loaded := pr.conMap.LoadOrStore(h.ID, con)
 		if !loaded {
@@ -83,9 +83,9 @@ func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, p []byte) {
 		con = actual.(*Conn)
 	} else {
 		con = v.(*Conn)
-		con.setRecvInfo(from, to)
+		con.handleRecvInfo(from, to)
 	}
-	con.handleRecvPacket(&h, r)
+	con.handleRecvPacket(from, &h, r)
 	return
 }
 
@@ -173,12 +173,7 @@ func Listen(addr string, pcc PacketConnConverter) (*Peer, error) {
 }
 
 func (pr *Peer) Dial(addr string) (*Conn, error) {
-	ipAndPort := strings.Split(addr, ":")
-	if len(ipAndPort) != 2 {
-		return nil, errIllegalAddr
-	}
-
-	port64, err := strconv.ParseUint(ipAndPort[1], 10, 16)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -188,8 +183,8 @@ func (pr *Peer) Dial(addr string) (*Conn, error) {
 		return nil, err
 	}
 
-	con := newConn(id, pr, ipAndPort[0])
-	con.setRmtPorts(uint16(port64))
+	con := newConn(id, pr)
+	con.setRmtAddr(udpAddr)
 	con.SetSendTimeout(5 * time.Second)
 
 	pr.conMap.Store(id, con)
@@ -233,11 +228,15 @@ func (pr *Peer) AcceptGatling() (*Conn, error) {
 	if !ok || con.IsClose() {
 		return nil, errClosed
 	}
-	con.handleRecvPacket(&header{
-		con.id,
-		1,
-		pktRequestPorts,
-	}, nil)
+	con.handleRecvPacket(
+		nil,
+		&header{
+			con.id,
+			1,
+			pktRequestPorts,
+		},
+		nil,
+	)
 	return con, nil
 }
 
