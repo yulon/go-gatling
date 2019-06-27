@@ -9,12 +9,14 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 type Peer struct {
 	lnPorts  []uint16
-	lnC      int
-	udpLnrs  []*net.UDPConn
+	pktLnrs  []net.PacketConn
 	lnPtr    uint
 	mtx      sync.Mutex
 	conMap   sync.Map
@@ -33,19 +35,19 @@ func (pr *Peer) unuse() {
 	}
 }
 
-func (pr *Peer) writeToUDP(p []byte, udpAddr *net.UDPAddr, count int) (sz int, err error) {
+func (pr *Peer) writeTo(p []byte, addr net.Addr, count int) (sz int, err error) {
 	pr.mtx.Lock()
 	defer pr.mtx.Unlock()
 
-	if len(pr.udpLnrs) == 0 {
+	if len(pr.pktLnrs) == 0 {
 		err = errClosed
 		return
 	}
 
 	for i := 0; i < count; i++ {
 		pr.lnPtr++
-		ix := int(pr.lnPtr % uint(len(pr.udpLnrs)))
-		sz, err = pr.udpLnrs[ix].WriteToUDP(p, udpAddr)
+		ix := int(pr.lnPtr % uint(len(pr.pktLnrs)))
+		sz, err = pr.pktLnrs[ix].WriteTo(p, addr)
 		if err != nil {
 			return
 		}
@@ -53,7 +55,7 @@ func (pr *Peer) writeToUDP(p []byte, udpAddr *net.UDPAddr, count int) (sz int, e
 	return
 }
 
-func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
+func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, p []byte) {
 	r := bytes.NewBuffer(p)
 	var h header
 	err := binary.Read(r, binary.LittleEndian, &h)
@@ -63,15 +65,15 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 	var con *Conn
 	v, ok := pr.conMap.Load(h.ID)
 	if !ok {
-		con = newConn(h.ID, pr, from.IP.String())
-		con.setRmtLastOutputInfo(from, to)
+		con = newConn(h.ID, pr, from.(*net.UDPAddr).IP.String())
+		con.setRecvInfo(from, to)
 
 		actual, loaded := pr.conMap.LoadOrStore(h.ID, con)
 		if !loaded {
 			if h.Type != pktRequestPorts || h.PktID != 1 {
 				h.Type = pktInvalid
 				h.PktID = 0
-				to.WriteToUDP(makePacket(&h), from)
+				to.WriteTo(makePacket(&h), from)
 				con.closeUS(errClosed)
 				return
 			}
@@ -81,55 +83,73 @@ func (pr *Peer) bypassRecvPacket(from *net.UDPAddr, to *net.UDPConn, p []byte) {
 		con = actual.(*Conn)
 	} else {
 		con = v.(*Conn)
-		con.setRmtLastOutputInfo(from, to)
+		con.setRecvInfo(from, to)
 	}
 	con.handleRecvPacket(&h, r)
 	return
 }
 
-func listen(ip string, basePort uint16, basePortIsHard bool, portCount int) (*Peer, error) {
+type PacketConnConverter func(net.PacketConn) net.PacketConn
+
+func listen(ip string, mainPort uint16, portCount int, pcc PacketConnConverter) (*Peer, error) {
 	pr := &Peer{
-		lnC:    portCount,
 		acptCh: make(chan *Conn, 1),
 	}
+
+	uniUDPAddr, err := net.ResolveUDPAddr("udp", ip+":0")
+	if err != nil {
+		return nil, err
+	}
+
 	for i := 0; i < portCount; {
-		udpAddr, err := net.ResolveUDPAddr("udp", ip+":"+strconv.FormatUint(uint64(basePort), 10))
-		if err != nil {
-			return nil, err
+		var udpAddr *net.UDPAddr
+		if i == 0 {
+			udpAddr = &net.UDPAddr{
+				IP:   uniUDPAddr.IP,
+				Port: int(mainPort),
+				Zone: uniUDPAddr.Zone,
+			}
+		} else {
+			udpAddr = uniUDPAddr
 		}
 
 		udpLnr, err := net.ListenUDP("udp", udpAddr)
 		if err != nil {
-			if basePortIsHard {
-				return nil, err
+			for _, pktLnr := range pr.pktLnrs {
+				pktLnr.Close()
 			}
-			basePort++
-			continue
+			return nil, err
+		}
+
+		var pktLnr net.PacketConn
+		if pcc != nil {
+			pktLnr = pcc(udpLnr)
+		} else {
+			pktLnr = udpLnr
 		}
 
 		go func() {
 			b := make([]byte, 1280)
 			for {
-				sz, addr, err := udpLnr.ReadFromUDP(b)
+				sz, addr, err := pktLnr.ReadFrom(b)
 				if err != nil {
-					fmt.Println("udpLnr.ReadFromUDP(b)", err)
+					fmt.Println("pktLnr.ReadFrom(b)", err)
 					return
 				}
-				pr.bypassRecvPacket(addr, udpLnr, b[:sz])
+				pr.bypassRecvPacket(addr, pktLnr, b[:sz])
 			}
 		}()
 
-		pr.udpLnrs = append(pr.udpLnrs, udpLnr)
-		pr.lnPorts = append(pr.lnPorts, basePort)
+		pr.pktLnrs = append(pr.pktLnrs, pktLnr)
+		pr.lnPorts = append(pr.lnPorts, uint16(pktLnr.LocalAddr().(*net.UDPAddr).Port))
 
 		i++
-		basePort++
 	}
 	pr.use()
 	return pr, nil
 }
 
-func Listen(addr string) (*Peer, error) {
+func Listen(addr string, pcc PacketConnConverter) (*Peer, error) {
 	ipAndPort := strings.Split(addr, ":")
 	if len(ipAndPort) != 2 {
 		return nil, errIllegalAddr
@@ -143,20 +163,51 @@ func Listen(addr string) (*Peer, error) {
 	}
 
 	if ipAndPort[1] == "*" {
-		return listen(ipAndPort[0], uint16(10000), false, portCount)
+		return listen(ipAndPort[0], 0, portCount, pcc)
 	}
 	port64, err := strconv.ParseUint(ipAndPort[1], 10, 16)
 	if err != nil {
 		return nil, err
 	}
-	return listen(ipAndPort[0], uint16(port64), true, portCount)
+	return listen(ipAndPort[0], uint16(port64), portCount, pcc)
 }
 
 func (pr *Peer) Dial(addr string) (*Conn, error) {
-	return dial(pr, addr)
+	ipAndPort := strings.Split(addr, ":")
+	if len(ipAndPort) != 2 {
+		return nil, errIllegalAddr
+	}
+
+	port64, err := strconv.ParseUint(ipAndPort[1], 10, 16)
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := uuid.NewUUID()
+	if err != nil {
+		return nil, err
+	}
+
+	con := newConn(id, pr, ipAndPort[0])
+	con.setRmtPorts(uint16(port64))
+	con.SetSendTimeout(5 * time.Second)
+
+	pr.conMap.Store(id, con)
+
+	err = con.send(pktRequestPorts)
+	if err != nil {
+		return nil, err
+	}
+
+	err = con.flush()
+	if err != nil {
+		return nil, err
+	}
+	con.SetSendTimeout(30 * time.Second)
+	return con, nil
 }
 
-func Dial(addr string) (*Conn, error) {
+func Dial(addr string, pcc PacketConnConverter) (*Conn, error) {
 	lnAddr := ":*"
 	ipAndPort := strings.Split(addr, ":")
 	if len(ipAndPort) != 2 {
@@ -165,7 +216,7 @@ func Dial(addr string) (*Conn, error) {
 	if ipAndPort[0] == "127.0.0.1" || ipAndPort[0] == "localhost" {
 		lnAddr = "localhost" + lnAddr
 	}
-	pr, err := Listen(lnAddr)
+	pr, err := Listen(lnAddr, pcc)
 	if err != nil {
 		return nil, err
 	}
@@ -195,21 +246,21 @@ func (pr *Peer) Accept() (net.Conn, error) {
 }
 
 func (pr *Peer) Addr() net.Addr {
-	return pr.udpLnrs[0].LocalAddr()
+	return pr.pktLnrs[0].LocalAddr()
 }
 
 func (pr *Peer) Close() error {
 	pr.mtx.Lock()
 	defer pr.mtx.Unlock()
 
-	if len(pr.udpLnrs) == 0 {
+	if len(pr.pktLnrs) == 0 {
 		return errClosed
 	}
 	close(pr.acptCh)
-	for _, udpLnr := range pr.udpLnrs {
+	for _, udpLnr := range pr.pktLnrs {
 		udpLnr.Close()
 	}
-	pr.udpLnrs = nil
+	pr.pktLnrs = nil
 	return nil
 }
 

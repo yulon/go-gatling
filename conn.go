@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,9 +18,9 @@ type recvData struct {
 	doneCh chan bool
 }
 
-type addrAndSender struct {
-	udpAddr   *net.UDPAddr
-	udpSender *net.UDPConn
+type sendInfo struct {
+	addr   net.Addr
+	sender net.PacketConn
 }
 
 type Conn struct {
@@ -32,7 +31,7 @@ type Conn struct {
 	rmtIP             string
 	rmtPorts          []uint16
 	rmtPortPtr        uint
-	rmtLastOutputInfo *addrAndSender
+	rmtLastOutputInfo *sendInfo
 
 	nowRTT              int64
 	nowSentPktSendCount int64
@@ -101,41 +100,6 @@ func newConn(id uuid.UUID, pr *Peer, rmtIP string) *Conn {
 var errIllegalAddr = errors.New("gatling: Illegal address.")
 var errTimeout = errors.New("gatling: Connection is timeout.")
 
-func dial(pr *Peer, addr string) (*Conn, error) {
-	ipAndPort := strings.Split(addr, ":")
-	if len(ipAndPort) != 2 {
-		return nil, errIllegalAddr
-	}
-
-	port64, err := strconv.ParseUint(ipAndPort[1], 10, 16)
-	if err != nil {
-		return nil, err
-	}
-
-	id, err := uuid.NewUUID()
-	if err != nil {
-		return nil, err
-	}
-
-	con := newConn(id, pr, ipAndPort[0])
-	con.setRmtPorts(uint16(port64))
-	con.SetSendTimeout(5 * time.Second)
-
-	pr.conMap.Store(id, con)
-
-	err = con.send(pktRequestPorts)
-	if err != nil {
-		return nil, err
-	}
-
-	err = con.flush()
-	if err != nil {
-		return nil, err
-	}
-	con.SetSendTimeout(30 * time.Second)
-	return con, nil
-}
-
 func (con *Conn) closeUS(recvErr error) error {
 	if con.closeStatus > 1 {
 		return nil
@@ -203,30 +167,33 @@ func (con *Conn) setRmtPorts(ports ...uint16) {
 	con.rmtPorts = ports
 }
 
-func (con *Conn) setRmtLastOutputInfo(udpAddr *net.UDPAddr, udpSender *net.UDPConn) {
+func (con *Conn) setRecvInfo(from net.Addr, to net.PacketConn) {
+	udpAddr := from.(*net.UDPAddr)
+
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
 	con.lastRecvTS = time.Now()
 
 	if con.rmtLastOutputInfo != nil {
-		if udpAddr.IP.Equal(con.rmtLastOutputInfo.udpAddr.IP) && udpAddr.Port == con.rmtLastOutputInfo.udpAddr.Port {
-			if udpSender != con.rmtLastOutputInfo.udpSender {
-				con.rmtLastOutputInfo.udpSender = nil
+		if udpAddr.IP.Equal(con.rmtLastOutputInfo.addr.(*net.UDPAddr).IP) &&
+			udpAddr.Port == con.rmtLastOutputInfo.addr.(*net.UDPAddr).Port {
+			if to != con.rmtLastOutputInfo.sender {
+				con.rmtLastOutputInfo.sender = nil
 			}
 			return
 		}
-		con.rmtLastOutputInfo.udpAddr = udpAddr
-		con.rmtLastOutputInfo.udpSender = udpSender
+		con.rmtLastOutputInfo.addr = from
+		con.rmtLastOutputInfo.sender = to
 		return
 	}
 
-	con.rmtLastOutputInfo = &addrAndSender{udpAddr, udpSender}
+	con.rmtLastOutputInfo = &sendInfo{from, to}
 }
 
 var errRmtAddrLoss = errors.New("gatling: Remote address loss.")
 
-func (con *Conn) rmtUDPAddrAndUDPSenderUS() (udpAddr *net.UDPAddr, udpSender *net.UDPConn, err error) {
+func (con *Conn) rmtUDPAddrAndUDPSenderUS() (addr net.Addr, sender net.PacketConn, err error) {
 	n := len(con.rmtPorts)
 	if con.rmtLastOutputInfo != nil {
 		n++
@@ -234,10 +201,10 @@ func (con *Conn) rmtUDPAddrAndUDPSenderUS() (udpAddr *net.UDPAddr, udpSender *ne
 	con.rmtPortPtr++
 	ix := int(con.rmtPortPtr % uint(n))
 	if ix == len(con.rmtPorts) {
-		udpAddr = con.rmtLastOutputInfo.udpAddr
-		udpSender = con.rmtLastOutputInfo.udpSender
+		addr = con.rmtLastOutputInfo.addr
+		sender = con.rmtLastOutputInfo.sender
 	} else {
-		udpAddr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
+		addr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
 		if err != nil {
 			return
 		}
@@ -247,13 +214,13 @@ func (con *Conn) rmtUDPAddrAndUDPSenderUS() (udpAddr *net.UDPAddr, udpSender *ne
 	if n > 0 {
 		con.rmtPortPtr++
 		ix := int(con.rmtPortPtr % uint(n))
-		udpAddr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
+		addr, err = net.ResolveUDPAddr("udp", con.rmtIP+":"+strconv.FormatUint(uint64(con.rmtPorts[ix]), 10))
 		if err != nil {
 			return
 		}
 	} else if con.rmtLastOutputInfo != nil {
-		udpAddr = con.rmtLastOutputInfo.udpAddr
-		udpSender = con.rmtLastOutputInfo.udpSender
+		addr = con.rmtLastOutputInfo.addr
+		sender = con.rmtLastOutputInfo.sender
 	} else {
 		err = errRmtAddrLoss
 		return
@@ -335,17 +302,17 @@ func (con *Conn) writeUS(b []byte, count int) (int, error) {
 	if con.closeStatus > 1 {
 		return 0, errClosed
 	}
-	udpAddr, udpSender, err := con.rmtUDPAddrAndUDPSenderUS()
+	addr, sender, err := con.rmtUDPAddrAndUDPSenderUS()
 	if err != nil {
 		con.closeUS(err)
 		return 0, err
 	}
 	var sz int
 	con.lastSendTS = time.Now()
-	if udpSender == nil {
-		sz, err = con.lcPr.writeToUDP(b, udpAddr, count)
+	if sender == nil {
+		sz, err = con.lcPr.writeTo(b, addr, count)
 	} else {
-		sz, err = udpSender.WriteToUDP(b, udpAddr)
+		sz, err = sender.WriteTo(b, addr)
 	}
 	if err != nil {
 		con.closeUS(err)
