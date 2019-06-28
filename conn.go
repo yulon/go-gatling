@@ -40,19 +40,21 @@ type Conn struct {
 	sendTimeout time.Duration
 	recvTimeout time.Duration
 
-	sendPktIDCount            uint64
-	sendPktCaches             []*sendPktCache
-	sendPktResenderIsRunning  bool
-	sendPktResendErr          error
-	sendPktCachesDecCond      *sync.Cond
-	waitSendPktCachesDecCount uint64
+	sendPktIDCount uint64
 
-	sentPktIDAppender        *idAppender
-	sentPktIDBase            uint64
+	resendPkts                  []*resendPktCtx
+	resendPktErr                error
+	pktTimeoutResenderIsRunning bool
+
+	sentPktIDAppender *idAppender
+	onSentPktCond     *sync.Cond
+	WaitSentPktCount  uint64
+
+	sentPktIDBaseCache       uint64
 	sentPktIDBaseRepeatCount int
 
-	someoneNoResendSentPktID uint64
-	someoneNoResendSentTS    time.Time
+	someoneSentPktID uint64
+	someonePktSentTS time.Time
 
 	recvPktIDAppender *idAppender
 
@@ -78,17 +80,17 @@ func newConn(id uuid.UUID, pr *Peer) *Conn {
 	pr.use()
 	now := time.Now()
 	con := &Conn{
-		id:                       id,
-		lcPr:                     pr,
-		nowRTT:                   int64(DefaultRTT),
-		minRTT:                   DefaultRTT,
-		lastSendTS:               now,
-		lastRecvTS:               now,
-		sendTimeout:              30 * time.Second,
-		recvTimeout:              90 * time.Second,
-		sentPktIDAppender:        newIDAppender(nil, nil),
-		sendPktResenderIsRunning: false,
-		recvPktIDAppender:        newIDAppender(&sync.Mutex{}, nil),
+		id:                          id,
+		lcPr:                        pr,
+		nowRTT:                      int64(DefaultRTT),
+		minRTT:                      DefaultRTT,
+		lastSendTS:                  now,
+		lastRecvTS:                  now,
+		sendTimeout:                 30 * time.Second,
+		recvTimeout:                 90 * time.Second,
+		sentPktIDAppender:           newIDAppender(nil, nil),
+		pktTimeoutResenderIsRunning: false,
+		recvPktIDAppender:           newIDAppender(&sync.Mutex{}, nil),
 	}
 	return con
 }
@@ -126,9 +128,9 @@ func (con *Conn) closeUS(recvErr error) error {
 	con.lcPr.conMap.Delete(con.id)
 	con.lcPr.unuse()
 
-	con.sendPktResendErr = recvErr
-	if con.waitSendPktCachesDecCount > 0 {
-		con.sendPktCachesDecCond.Broadcast()
+	con.resendPktErr = recvErr
+	if con.WaitSentPktCount > 0 {
+		con.onSentPktCond.Broadcast()
 	}
 
 	con.putRecvPkt(nil, recvErr)
@@ -299,26 +301,27 @@ func (con *Conn) write(b []byte, count int) (int, error) {
 
 var errIntervalTooBrief = errors.New("gatling: Interval too brief.")
 
-type sendPktCache struct {
+type resendPktCtx struct {
 	id          uint64
 	p           []byte
 	firstSendTS time.Time
 	lastSendTS  time.Time
 	sendCount   int64
+	lossCount   uint8
 }
 
-func (con *Conn) sendCacheUS(spc *sendPktCache, count int) error {
+func (con *Conn) resendUS(spc *resendPktCtx, count int) error {
 	spc.sendCount++
 	_, err := con.writeUS(spc.p, count)
 	spc.lastSendTS = con.lastSendTS
 	return err
 }
 
-func (con *Conn) sendCache(spc *sendPktCache, count int) error {
+func (con *Conn) resend(spc *resendPktCtx, count int) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	return con.sendCacheUS(spc, count)
+	return con.resendUS(spc, count)
 }
 
 func (con *Conn) sendUS(typ byte, others ...interface{}) error {
@@ -340,46 +343,48 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 		return err
 	}
 
-	spc := &sendPktCache{
+	spc := &resendPktCtx{
 		id: h.PktID,
 		p:  p,
 	}
 
-	for {
-		if con.closeStatus > 1 {
-			if con.sendPktResendErr != nil {
-				return con.sendPktResendErr
-			}
-			return errClosed
-		}
-		if len(con.sendPktCaches) < sendPktCachesMax {
-			break
-		}
-		if con.sendPktCachesDecCond == nil {
-			con.sendPktCachesDecCond = sync.NewCond(&con.mtx)
-		}
-		con.waitSendPktCachesDecCount++
-		con.sendPktCachesDecCond.Wait()
-		con.waitSendPktCachesDecCount--
-	}
-
-	if con.sentPktIDAppender.Has(spc.id) {
-		if spc.id == con.someoneNoResendSentPktID {
-			con.updateRTTAndSPSCUS(con.someoneNoResendSentTS.Sub(spc.firstSendTS), 1)
-			con.someoneNoResendSentPktID = 0
-		}
-		return nil
-	}
-
-	con.sendPktCaches = append(con.sendPktCaches, spc)
-
-	err := con.sendCacheUS(spc, 1)
+	err := con.resendUS(spc, 1)
 	spc.firstSendTS = spc.lastSendTS
 	if err != nil {
 		return err
 	}
 
-	if con.sendPktResenderIsRunning {
+	for {
+		if con.closeStatus > 1 {
+			if con.resendPktErr != nil {
+				return con.resendPktErr
+			}
+			return errClosed
+		}
+
+		if len(con.resendPkts) < resendPktsMax {
+			break
+		}
+
+		if con.onSentPktCond == nil {
+			con.onSentPktCond = sync.NewCond(&con.mtx)
+		}
+		con.WaitSentPktCount++
+		con.onSentPktCond.Wait()
+		con.WaitSentPktCount--
+
+		if con.sentPktIDAppender.Has(spc.id) {
+			if spc.id == con.someoneSentPktID {
+				con.updateRTTAndSPSCUS(con.someonePktSentTS.Sub(spc.firstSendTS), 1)
+				con.someoneSentPktID = 0
+			}
+			return nil
+		}
+	}
+
+	con.resendPkts = append(con.resendPkts, spc)
+
+	if con.pktTimeoutResenderIsRunning {
 		return nil
 	}
 
@@ -387,67 +392,42 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 		for {
 			con.mtx.Lock()
 
-			if len(con.sendPktCaches) == 0 {
-				con.sendPktResenderIsRunning = false
+			if len(con.resendPkts) == 0 {
+				con.pktTimeoutResenderIsRunning = false
 				con.mtx.Unlock()
 				return
 			}
 
-			var timeoutSendPktCaches []*sendPktCache
+			dur := con.minRTT
 
 			now := time.Now()
-			minRTT := con.minRTT
-
-			for i := len(con.sendPktCaches) - 1; i >= 0; i-- {
-				spc := con.sendPktCaches[i]
-				if now.Sub(spc.lastSendTS) < minRTT {
-					continue
-				}
-				if now.Sub(spc.firstSendTS) > con.sendTimeout {
+			for _, spc := range con.resendPkts {
+				if now.Sub(spc.firstSendTS) > 30*time.Second {
 					con.closeUS(errTimeout)
 					con.mtx.Unlock()
 					return
 				}
-				err := con.sendCacheUS(spc, 1)
+				diff := now.Sub(spc.lastSendTS)
+				if now.Sub(spc.lastSendTS) < con.minRTT {
+					if diff < dur {
+						dur = diff
+					}
+					continue
+				}
+				err := con.resendUS(spc, 1)
 				if err != nil {
 					con.mtx.Unlock()
 					return
 				}
-				break
 			}
-
-			/*for _, spc := range con.sendPktCaches {
-				if now.Sub(spc.firstSendTS) > 30*time.Second {
-					con.closeUS(false)
-					con.mtx.Unlock()
-					fmt.Println("sendPktResender: send timeout", spc.id)
-					return
-				}
-				if now.Sub(spc.lastSendTS) >= con.vRTT() {
-					timeoutSendPktCaches = append(timeoutSendPktCaches, spc)
-				}
-			}*/
 
 			con.mtx.Unlock()
 
-			if len(timeoutSendPktCaches) == 0 {
-				time.Sleep(minRTT)
-				continue
-			}
-
-			dur := minRTT / time.Duration(len(timeoutSendPktCaches))
-			for _, spc := range timeoutSendPktCaches {
-				time.Sleep(dur)
-
-				err := con.sendCache(spc, 3)
-				if err != nil {
-					return
-				}
-			}
+			time.Sleep(dur + dur/10)
 		}
 	}()
 
-	con.sendPktResenderIsRunning = true
+	con.pktTimeoutResenderIsRunning = true
 
 	return nil
 }
@@ -462,20 +442,20 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 func (con *Conn) flushUS() error {
 	for {
 		if con.closeStatus > 1 {
-			if con.sendPktResendErr != nil {
-				return con.sendPktResendErr
+			if con.resendPktErr != nil {
+				return con.resendPktErr
 			}
 			return errClosed
 		}
-		if len(con.sendPktCaches) == 0 {
+		if len(con.resendPkts) == 0 {
 			return nil
 		}
-		if con.sendPktCachesDecCond == nil {
-			con.sendPktCachesDecCond = sync.NewCond(&con.mtx)
+		if con.onSentPktCond == nil {
+			con.onSentPktCond = sync.NewCond(&con.mtx)
 		}
-		con.waitSendPktCachesDecCount++
-		con.sendPktCachesDecCond.Wait()
-		con.waitSendPktCachesDecCount--
+		con.WaitSentPktCount++
+		con.onSentPktCond.Wait()
+		con.WaitSentPktCount--
 	}
 }
 
@@ -517,65 +497,83 @@ func (con *Conn) unresend(pktIDs ...uint64) {
 
 	con.mtx.Lock()
 
-	sendPktCachesBeforeLen := len(con.sendPktCaches)
-
-	isRms := false
+	isSent := false
 	for _, pktID := range pktIDs {
 		if !con.sentPktIDAppender.TryAdd(pktID, nil) {
 			continue
 		}
-		isRm := false
-		for i, spc := range con.sendPktCaches {
+		isSent = true
+		isCached := false
+		for i, spc := range con.resendPkts {
 			if spc.id == pktID {
 				nowRTT := now.Sub(spc.firstSendTS)
 				con.updateRTTAndSPSCUS(nowRTT, spc.sendCount)
 
-				if i == len(con.sendPktCaches)-1 {
-					con.sendPktCaches = con.sendPktCaches[:i]
+				if i == len(con.resendPkts)-1 {
+					con.resendPkts = con.resendPkts[:i]
 					break
 				}
-				sendPktCacheRights := make([]*sendPktCache, len(con.sendPktCaches[i+1:]))
-				copy(sendPktCacheRights, con.sendPktCaches[i+1:])
-				con.sendPktCaches = con.sendPktCaches[:len(con.sendPktCaches)-1]
-				copy(con.sendPktCaches[i:], sendPktCacheRights)
+				resendPktRights := make([]*resendPktCtx, len(con.resendPkts[i+1:]))
+				copy(resendPktRights, con.resendPkts[i+1:])
+				con.resendPkts = con.resendPkts[:len(con.resendPkts)-1]
+				copy(con.resendPkts[i:], resendPktRights)
 
-				isRm = true
-				isRms = true
+				isCached = true
 				break
 			}
 		}
-		if !isRm && con.someoneNoResendSentPktID == 0 {
-			con.someoneNoResendSentPktID = pktID
-			con.someoneNoResendSentTS = now
+		if !isCached && con.someoneSentPktID == 0 {
+			con.someoneSentPktID = pktID
+			con.someonePktSentTS = now
 		}
 	}
-	if isRms {
-		if con.sentPktIDBase == con.sentPktIDAppender.baseID {
-			con.sentPktIDBaseRepeatCount++
-			if con.sentPktIDBaseRepeatCount > 2 {
-				con.sentPktIDBaseRepeatCount = 0
-				c := 0
-				for _, spc := range con.sendPktCaches {
-					if c > 31 {
-						break
-					}
-					err := con.sendCacheUS(spc, 1)
+	if isSent {
+		if len(con.resendPkts) > 0 {
+			if con.sentPktIDBaseCache == con.sentPktIDAppender.baseID {
+				con.sentPktIDBaseRepeatCount++
+				if con.sentPktIDBaseRepeatCount > 2 {
+					con.sentPktIDBaseRepeatCount = 0
+
+					err := con.resendUS(con.resendPkts[0], 1)
 					if err != nil {
-						con.mtx.Unlock()
 						return
 					}
-					c++
+
+					/*if !con.pktNoDiffResenderIsRunning {
+						con.pktNoDiffResenderIsRunning = true
+						go func() {
+							con.mtx.Lock()
+							defer func() {
+								con.pktNoDiffResenderIsRunning = false
+								con.mtx.Unlock()
+							}()
+
+							c := len(con.resendPkts)
+							if c == 0 {
+								return
+							}
+							if c > 11 {
+								c = 11
+							}
+							for i := 0; i < c; i++ {
+								err := con.resendUS(con.resendPkts[i], 1)
+								if err != nil {
+									return
+								}
+							}
+						}()
+					}*/
 				}
+			} else {
+				con.sentPktIDBaseCache = con.sentPktIDAppender.baseID
+				con.sentPktIDBaseRepeatCount = 0
 			}
-		} else {
-			con.sentPktIDBase = con.sentPktIDAppender.baseID
-			con.sentPktIDBaseRepeatCount = 0
 		}
-	}
-	if con.waitSendPktCachesDecCount > 0 && len(con.sendPktCaches) < sendPktCachesBeforeLen {
-		con.mtx.Unlock()
-		con.sendPktCachesDecCond.Broadcast()
-		return
+		if con.WaitSentPktCount > 0 {
+			con.mtx.Unlock()
+			con.onSentPktCond.Broadcast()
+			return
+		}
 	}
 
 	con.mtx.Unlock()

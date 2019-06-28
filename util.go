@@ -45,7 +45,7 @@ type header struct {
 
 var headerSz = binary.Size(&header{})
 
-const sendPktCachesMax = 1024
+const resendPktsMax = 1024
 
 const DefaultRTT = 266 * time.Millisecond
 
