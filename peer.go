@@ -3,7 +3,6 @@ package gatling
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -22,7 +21,6 @@ type Peer struct {
 	conMap   sync.Map
 	acptCh   chan *Conn
 	useCount int64
-	isClosed bool
 }
 
 func (pr *Peer) use() {
@@ -133,7 +131,6 @@ func listen(ip string, mainPort uint16, portCount int, pcc PacketConnConverter) 
 			for {
 				sz, addr, err := pktLnr.ReadFrom(b)
 				if err != nil {
-					fmt.Println("pktLnr.ReadFrom(b)", err)
 					return
 				}
 				pr.bypassRecvPacket(addr, pktLnr, b[:sz])
@@ -145,6 +142,33 @@ func listen(ip string, mainPort uint16, portCount int, pcc PacketConnConverter) 
 
 		i++
 	}
+
+	go func() {
+		for {
+			dur := 90 * time.Second
+
+			now := time.Now()
+			pr.conMap.Range(func(_, v interface{}) bool {
+				con := v.(*Conn)
+				con.mtx.Lock()
+				defer con.mtx.Unlock()
+
+				endTime := con.lastReadTime.Add(con.readTimeout)
+				if now.Before(endTime) {
+					diff := endTime.Sub(now)
+					if diff < dur {
+						dur = diff
+					}
+					return true
+				}
+				con.closeUS(errTimeout)
+				return true
+			})
+
+			time.Sleep(dur)
+		}
+	}()
+
 	pr.use()
 	return pr, nil
 }
@@ -185,7 +209,7 @@ func (pr *Peer) Dial(addr string) (*Conn, error) {
 
 	con := newConn(id, pr)
 	con.setRmtAddr(udpAddr)
-	con.SetSendTimeout(5 * time.Second)
+	con.SetWriteTimeout(5 * time.Second)
 
 	pr.conMap.Store(id, con)
 
@@ -198,7 +222,7 @@ func (pr *Peer) Dial(addr string) (*Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	con.SetSendTimeout(30 * time.Second)
+	con.SetWriteTimeout(30 * time.Second)
 	return con, nil
 }
 
@@ -245,6 +269,12 @@ func (pr *Peer) Accept() (net.Conn, error) {
 }
 
 func (pr *Peer) Addr() net.Addr {
+	pr.mtx.Lock()
+	defer pr.mtx.Unlock()
+
+	if len(pr.pktLnrs) == 0 {
+		return nil
+	}
 	return pr.pktLnrs[0].LocalAddr()
 }
 

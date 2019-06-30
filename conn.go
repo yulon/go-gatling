@@ -34,11 +34,10 @@ type Conn struct {
 	nowSentPktSendCount int64
 	minRTT              time.Duration
 
-	lastSendTS time.Time
-	lastRecvTS time.Time
-
-	sendTimeout time.Duration
-	recvTimeout time.Duration
+	lastWriteTime time.Time
+	lastReadTime  time.Time
+	writeTimeout  time.Duration
+	readTimeout   time.Duration
 
 	sendPktIDCount uint64
 
@@ -84,10 +83,10 @@ func newConn(id uuid.UUID, pr *Peer) *Conn {
 		lcPr:                        pr,
 		nowRTT:                      int64(DefaultRTT),
 		minRTT:                      DefaultRTT,
-		lastSendTS:                  now,
-		lastRecvTS:                  now,
-		sendTimeout:                 30 * time.Second,
-		recvTimeout:                 90 * time.Second,
+		lastWriteTime:               now,
+		lastReadTime:                now,
+		writeTimeout:                30 * time.Second,
+		readTimeout:                 90 * time.Second,
 		sentPktIDAppender:           newIDAppender(nil, nil),
 		pktTimeoutResenderIsRunning: false,
 		recvPktIDAppender:           newIDAppender(&sync.Mutex{}, nil),
@@ -127,6 +126,8 @@ func (con *Conn) closeUS(recvErr error) error {
 
 	con.lcPr.conMap.Delete(con.id)
 	con.lcPr.unuse()
+
+	con.sendInfos = nil
 
 	con.resendPktErr = recvErr
 	if con.WaitSentPktCount > 0 {
@@ -183,7 +184,7 @@ func (con *Conn) handleRecvInfo(from net.Addr, to net.PacketConn) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	con.lastRecvTS = time.Now()
+	con.lastReadTime = time.Now()
 
 	for _, si := range con.sendInfos {
 		siUDPAddr := si.addr.(*net.UDPAddr)
@@ -200,23 +201,17 @@ func (con *Conn) handleRecvInfo(from net.Addr, to net.PacketConn) {
 var errRmtAddrLoss = errors.New("gatling: Remote address loss.")
 
 func (con *Conn) LocalAddr() net.Addr {
-	return nil
+	return con.lcPr.Addr()
 }
 
 func (con *Conn) RemoteAddr() net.Addr {
-	return nil
-}
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
 
-func (con *Conn) SetDeadline(t time.Time) error {
-	return nil
-}
-
-func (con *Conn) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-func (con *Conn) SetWriteDeadline(t time.Time) error {
-	return nil
+	if len(con.sendInfos) == 0 {
+		return nil
+	}
+	return con.sendInfos[0].addr
 }
 
 func (con *Conn) ID() uuid.UUID {
@@ -231,42 +226,77 @@ func (con *Conn) PacketLoss() float32 {
 	return float32(1) - float32(1)/float32(atomic.LoadInt64(&con.nowSentPktSendCount))
 }
 
-func (con *Conn) LastRecvTS() time.Time {
+func (con *Conn) LastReadTime() time.Time {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	return con.lastRecvTS
+	return con.lastReadTime
 }
 
-func (con *Conn) LastSendTS() time.Time {
+func (con *Conn) LastWriteTime() time.Time {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	return con.lastSendTS
+	return con.lastWriteTime
 }
 
-func (con *Conn) LastActivityTS() time.Time {
+func (con *Conn) LastActivityTime() time.Time {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	if con.lastRecvTS.Sub(con.lastSendTS) > 0 {
-		return con.lastRecvTS
+	if con.lastReadTime.Sub(con.lastWriteTime) > 0 {
+		return con.lastReadTime
 	}
-	return con.lastSendTS
+	return con.lastWriteTime
 }
 
-func (con *Conn) SetSendTimeout(dur time.Duration) {
+func (con *Conn) SetWriteTimeout(dur time.Duration) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	con.sendTimeout = dur
+	con.writeTimeout = dur
 }
 
-func (con *Conn) SetRecvTimeout(dur time.Duration) {
+func (con *Conn) SetReadTimeout(dur time.Duration) {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	con.recvTimeout = dur
+	con.readTimeout = dur
+}
+
+func (con *Conn) SetReadDeadline(t time.Time) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	if con.closeStatus > 0 {
+		return errClosed
+	}
+	con.readTimeout = t.Sub(time.Now())
+	return nil
+}
+
+func (con *Conn) SetWriteDeadline(t time.Time) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	if con.closeStatus > 0 {
+		return errClosed
+	}
+	con.writeTimeout = t.Sub(time.Now())
+	return nil
+}
+
+func (con *Conn) SetDeadline(t time.Time) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	if con.closeStatus > 0 {
+		return errClosed
+	}
+	dur := t.Sub(time.Now())
+	con.readTimeout = dur
+	con.writeTimeout = dur
+	return nil
 }
 
 func (con *Conn) writeUS(b []byte, count int) (int, error) {
@@ -280,7 +310,7 @@ func (con *Conn) writeUS(b []byte, count int) (int, error) {
 
 	var sz int
 	var err error
-	con.lastSendTS = time.Now()
+	con.lastWriteTime = time.Now()
 	if sendInfo.sender == nil {
 		sz, err = con.lcPr.writeTo(b, sendInfo.addr, count)
 	} else {
@@ -302,18 +332,17 @@ func (con *Conn) write(b []byte, count int) (int, error) {
 var errIntervalTooBrief = errors.New("gatling: Interval too brief.")
 
 type resendPktCtx struct {
-	id          uint64
-	p           []byte
-	firstSendTS time.Time
-	lastSendTS  time.Time
-	sendCount   int64
-	lossCount   uint8
+	id            uint64
+	p             []byte
+	firstSendTime time.Time
+	lastSendTime  time.Time
+	sendCount     int64
 }
 
 func (con *Conn) resendUS(spc *resendPktCtx, count int) error {
 	spc.sendCount++
 	_, err := con.writeUS(spc.p, count)
-	spc.lastSendTS = con.lastSendTS
+	spc.lastSendTime = con.lastWriteTime
 	return err
 }
 
@@ -349,7 +378,7 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	}
 
 	err := con.resendUS(spc, 1)
-	spc.firstSendTS = spc.lastSendTS
+	spc.firstSendTime = spc.lastSendTime
 	if err != nil {
 		return err
 	}
@@ -375,7 +404,7 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 
 		if con.sentPktIDAppender.Has(spc.id) {
 			if spc.id == con.someoneSentPktID {
-				con.updateRTTAndSPSCUS(con.someonePktSentTS.Sub(spc.firstSendTS), 1)
+				con.updateRTTAndSPSCUS(con.someonePktSentTS.Sub(spc.firstSendTime), 1)
 				con.someoneSentPktID = 0
 			}
 			return nil
@@ -402,13 +431,13 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 
 			now := time.Now()
 			for _, spc := range con.resendPkts {
-				if now.Sub(spc.firstSendTS) > 30*time.Second {
+				if now.Sub(spc.firstSendTime) > con.writeTimeout {
 					con.closeUS(errTimeout)
 					con.mtx.Unlock()
 					return
 				}
-				diff := now.Sub(spc.lastSendTS)
-				if now.Sub(spc.lastSendTS) < con.minRTT {
+				diff := now.Sub(spc.lastSendTime)
+				if now.Sub(spc.lastSendTime) < con.minRTT {
 					if diff < dur {
 						dur = diff
 					}
@@ -478,7 +507,7 @@ func (con *Conn) Pace() error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	if time.Now().Sub(con.lastSendTS.Add(con.minRTT)) <= 0 {
+	if time.Now().Sub(con.lastWriteTime.Add(con.minRTT)) <= 0 {
 		return errIntervalTooBrief
 	}
 	return con.sendUS(pktHeartbeat)
@@ -506,7 +535,7 @@ func (con *Conn) unresend(pktIDs ...uint64) {
 		isCached := false
 		for i, spc := range con.resendPkts {
 			if spc.id == pktID {
-				nowRTT := now.Sub(spc.firstSendTS)
+				nowRTT := now.Sub(spc.firstSendTime)
 				con.updateRTTAndSPSCUS(nowRTT, spc.sendCount)
 
 				if i == len(con.resendPkts)-1 {
