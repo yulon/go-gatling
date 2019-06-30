@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -89,26 +87,14 @@ func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, p []byte) {
 
 type PacketConnConverter func(net.PacketConn) net.PacketConn
 
-func listen(ip string, mainPort uint16, portCount int, pcc PacketConnConverter) (*Peer, error) {
+func ListenUDP(udpAddr *net.UDPAddr, portCount int, pcc PacketConnConverter) (*Peer, error) {
 	pr := &Peer{
 		acptCh: make(chan *Conn, 1),
 	}
 
-	uniUDPAddr, err := net.ResolveUDPAddr("udp", ip+":0")
-	if err != nil {
-		return nil, err
-	}
-
-	for i := 0; i < portCount; {
-		var udpAddr *net.UDPAddr
-		if i == 0 {
-			udpAddr = &net.UDPAddr{
-				IP:   uniUDPAddr.IP,
-				Port: int(mainPort),
-				Zone: uniUDPAddr.Zone,
-			}
-		} else {
-			udpAddr = uniUDPAddr
+	for i := 0; i < portCount; i++ {
+		if i == 1 {
+			udpAddr.Port = 0
 		}
 
 		udpLnr, err := net.ListenUDP("udp", udpAddr)
@@ -139,8 +125,6 @@ func listen(ip string, mainPort uint16, portCount int, pcc PacketConnConverter) 
 
 		pr.pktLnrs = append(pr.pktLnrs, pktLnr)
 		pr.lnPorts = append(pr.lnPorts, uint16(pktLnr.LocalAddr().(*net.UDPAddr).Port))
-
-		i++
 	}
 
 	go func() {
@@ -173,35 +157,15 @@ func listen(ip string, mainPort uint16, portCount int, pcc PacketConnConverter) 
 	return pr, nil
 }
 
-func Listen(addr string, pcc PacketConnConverter) (*Peer, error) {
-	ipAndPort := strings.Split(addr, ":")
-	if len(ipAndPort) != 2 {
-		return nil, errIllegalAddr
-	}
-
-	portCount := 1
-
-	if ipAndPort[1][len(ipAndPort[1])-1] == '+' {
-		portCount = 512
-		ipAndPort[1] = ipAndPort[1][:len(ipAndPort[1])-1]
-	}
-
-	if ipAndPort[1] == "*" {
-		return listen(ipAndPort[0], 0, portCount, pcc)
-	}
-	port64, err := strconv.ParseUint(ipAndPort[1], 10, 16)
-	if err != nil {
-		return nil, err
-	}
-	return listen(ipAndPort[0], uint16(port64), portCount, pcc)
-}
-
-func (pr *Peer) Dial(addr string) (*Conn, error) {
+func Listen(addr string, portCount int, pcc PacketConnConverter) (*Peer, error) {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
+	return ListenUDP(udpAddr, portCount, pcc)
+}
 
+func (pr *Peer) DialUDP(udpAddr *net.UDPAddr) (*Conn, error) {
 	id, err := uuid.NewUUID()
 	if err != nil {
 		return nil, err
@@ -226,25 +190,41 @@ func (pr *Peer) Dial(addr string) (*Conn, error) {
 	return con, nil
 }
 
-func Dial(addr string, pcc PacketConnConverter) (*Conn, error) {
-	lnAddr := ":*"
-	ipAndPort := strings.Split(addr, ":")
-	if len(ipAndPort) != 2 {
-		return nil, errIllegalAddr
-	}
-	if ipAndPort[0] == "127.0.0.1" || ipAndPort[0] == "localhost" {
-		lnAddr = "localhost" + lnAddr
-	}
-	pr, err := Listen(lnAddr, pcc)
+func (pr *Peer) Dial(addr string) (*Conn, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
 		return nil, err
 	}
-	con, err := pr.Dial(addr)
+	return pr.DialUDP(udpAddr)
+}
+
+var ipv4Localhost = net.ParseIP("127.0.0.1")
+
+func DialUDP(remoteUDPAddr *net.UDPAddr, localPortCount int, pcc PacketConnConverter) (*Conn, error) {
+	localUDPAddr := &net.UDPAddr{}
+	if remoteUDPAddr.IP.Equal(ipv4Localhost) {
+		localUDPAddr.IP = ipv4Localhost
+	} else {
+		localUDPAddr.IP = net.IPv4zero
+	}
+	pr, err := ListenUDP(localUDPAddr, localPortCount, pcc)
+	if err != nil {
+		return nil, err
+	}
+	con, err := pr.DialUDP(remoteUDPAddr)
 	if err != nil {
 		return nil, err
 	}
 	pr.unuse()
 	return con, err
+}
+
+func Dial(remoteAddr string, localPortCount int, pcc PacketConnConverter) (*Conn, error) {
+	remoteUDPAddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	if err != nil {
+		return nil, err
+	}
+	return DialUDP(remoteUDPAddr, localPortCount, pcc)
 }
 
 func (pr *Peer) AcceptGatling() (*Conn, error) {

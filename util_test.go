@@ -26,7 +26,7 @@ func TestIDAppender(*testing.T) {
 }
 
 func TestConn(*testing.T) {
-	pr, err := Listen("localhost:8828+", nil)
+	pr, err := Listen("localhost:8828", 512, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -55,7 +55,7 @@ func TestConn(*testing.T) {
 		con.Write([]byte("000"))
 	}()
 
-	con, err := Dial("127.0.0.1:8828", nil)
+	con, err := Dial("127.0.0.1:8828", 1, nil)
 	if err != nil {
 		panic(err)
 	}
