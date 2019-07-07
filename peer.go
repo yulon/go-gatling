@@ -111,6 +111,9 @@ func ListenUDP(udpAddr *net.UDPAddr, portCount int, pcc PacketConnConverter) (*P
 		lnPortsHash: 1,
 	}
 
+	if portCount > 512 {
+		portCount = 512
+	}
 	for i := 0; i < portCount; i++ {
 		if i == 1 {
 			udpAddr.Port = 0

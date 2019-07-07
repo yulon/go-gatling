@@ -250,7 +250,8 @@ func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r
 
 		con.setRmtAddrUS(from, ports...)
 		if con.rmtPortsHash != h.SrcPortsHash {
-			con.close(errPortsHashMismatch)
+			con.closeUS(errPortsHashMismatch)
+			con.mtx.Unlock()
 			return
 		}
 
