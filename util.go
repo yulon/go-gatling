@@ -47,7 +47,58 @@ const resendPktsMax = 1024
 
 const DefaultRTT = 266 * time.Millisecond
 
-var portsMap sync.Map
+type hashedPorts struct {
+	hash  uint64
+	ports []uint16
+}
+
+type hashedPortsMap struct {
+	mp  map[string]*hashedPorts
+	mtx sync.Mutex
+}
+
+func newHashedPortsMap() *hashedPortsMap {
+	return &hashedPortsMap{mp: map[string]*hashedPorts{}}
+}
+
+func (hpm *hashedPortsMap) Store(addrStr string, portsHash uint64, ports []uint16) {
+	hpm.mtx.Lock()
+	defer hpm.mtx.Unlock()
+
+	pwh, loaded := hpm.mp[addrStr]
+	if !loaded {
+		hpm.mp[addrStr] = &hashedPorts{portsHash, ports}
+		return
+	}
+	if pwh.hash == portsHash {
+		return
+	}
+	pwh.hash = portsHash
+	pwh.ports = ports
+}
+
+func (hpm *hashedPortsMap) Load(addrStr string) *hashedPorts {
+	hpm.mtx.Lock()
+	defer hpm.mtx.Unlock()
+
+	return hpm.mp[addrStr]
+}
+
+func (hpm *hashedPortsMap) Delete(addrStr string, portsHash uint64) {
+	hpm.mtx.Lock()
+	defer hpm.mtx.Unlock()
+
+	pwh, loaded := hpm.mp[addrStr]
+	if !loaded {
+		return
+	}
+	if pwh.hash != portsHash {
+		return
+	}
+	delete(hpm.mp, addrStr)
+}
+
+var portsCache = newHashedPortsMap()
 
 func makeData(others ...interface{}) []byte {
 	buf := bytes.NewBuffer([]byte{})

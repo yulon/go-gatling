@@ -158,6 +158,24 @@ func (con *Conn) Close() error {
 	return con.close(nil)
 }
 
+func (con *Conn) tryCloseWhenTimeoutUS() bool {
+	if con.isHandshaked || con.rmtPortsHash == 0 {
+		con.closeUS(errTimeout)
+		return true
+	}
+
+	portsCache.Delete(con.sendInfos[0].addr.String(), con.rmtPortsHash)
+
+	con.rmtPortsHash = 0
+	con.sendInfos = con.sendInfos[:1]
+
+	con.lastReadTime = con.lastWriteTime
+	for _, rspc := range con.resendPkts {
+		rspc.firstSendTime = rspc.lastSendTime
+	}
+	return false
+}
+
 func (con *Conn) IsClose() bool {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
@@ -165,24 +183,17 @@ func (con *Conn) IsClose() bool {
 	return con.closeState > 0
 }
 
-func (con *Conn) setRmtAddrUS(mainAddr net.Addr, ports ...uint16) {
-	mainUDPAddr := mainAddr.(*net.UDPAddr)
-	con.sendInfos = []*sendInfo{&sendInfo{mainUDPAddr, nil}}
-
+func (con *Conn) setRmtAddrUS(referAddr net.Addr, ports ...uint16) {
+	referUDPAddr := referAddr.(*net.UDPAddr)
 	if len(ports) == 0 {
-		con.rmtPortsHash = 0
+		con.sendInfos = []*sendInfo{&sendInfo{referUDPAddr, nil}}
 		return
 	}
-	con.rmtPortsHash = 1
 	for _, port := range ports {
-		con.rmtPortsHash = con.rmtPortsHash*hSeed + uint64(port)
-		if port == uint16(mainUDPAddr.Port) {
-			continue
-		}
 		con.sendInfos = append(con.sendInfos, &sendInfo{&net.UDPAddr{
-			IP:   mainUDPAddr.IP,
+			IP:   referUDPAddr.IP,
 			Port: int(port),
-			Zone: mainUDPAddr.Zone,
+			Zone: referUDPAddr.Zone,
 		}, nil})
 	}
 }
@@ -248,18 +259,26 @@ func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r
 
 		con.mtx.Lock()
 
-		con.setRmtAddrUS(from, ports...)
-		if con.rmtPortsHash != h.SrcPortsHash {
+		if con.rmtPortsHash == h.SrcPortsHash {
+			con.mtx.Unlock()
+			return
+		}
+
+		portsHash := hashU16(ports)
+		if portsHash != h.SrcPortsHash {
 			con.closeUS(errPortsHashMismatch)
 			con.mtx.Unlock()
 			return
 		}
 
+		con.rmtPortsHash = portsHash
+		con.setRmtAddrUS(from, ports...)
+
 		rmtAddr := con.sendInfos[0].addr.String()
 
 		con.mtx.Unlock()
 
-		portsMap.Store(rmtAddr, ports)
+		portsCache.Store(rmtAddr, portsHash, ports)
 
 	case pktClosed:
 		fallthrough
@@ -405,30 +424,6 @@ func (con *Conn) write(b []byte, count int) (int, error) {
 	return con.writeUS(b, count)
 }
 
-var errIntervalTooBrief = errors.New("gatling: Interval too brief.")
-
-type resendPktCtx struct {
-	id            uint64
-	p             []byte
-	firstSendTime time.Time
-	lastSendTime  time.Time
-	sendCount     int64
-}
-
-func (con *Conn) resendUS(spc *resendPktCtx, count int) error {
-	spc.sendCount++
-	_, err := con.writeUS(spc.p, count)
-	spc.lastSendTime = con.lastWriteTime
-	return err
-}
-
-func (con *Conn) resend(spc *resendPktCtx, count int) error {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-
-	return con.resendUS(spc, count)
-}
-
 func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	isReliable := isReliableType[typ]
 
@@ -450,13 +445,13 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 		return err
 	}
 
-	spc := &resendPktCtx{
+	rspc := &resendPktCtx{
 		id: h.PktID,
 		p:  p,
 	}
 
-	err := con.resendUS(spc, 1)
-	spc.firstSendTime = spc.lastSendTime
+	err := con.resendUS(rspc, 1)
+	rspc.firstSendTime = rspc.lastSendTime
 	if err != nil {
 		return err
 	}
@@ -480,16 +475,16 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 		con.onSentPktCond.Wait()
 		con.WaitSentPktCount--
 
-		if con.sentPktIDAppender.Has(spc.id) {
-			if spc.id == con.someoneSentPktID {
-				con.updateRTTAndSPSCUS(con.someonePktSentTS.Sub(spc.firstSendTime), 1)
+		if con.sentPktIDAppender.Has(rspc.id) {
+			if rspc.id == con.someoneSentPktID {
+				con.updateRTTAndSPSCUS(con.someonePktSentTS.Sub(rspc.firstSendTime), 1)
 				con.someoneSentPktID = 0
 			}
 			return nil
 		}
 	}
 
-	con.resendPkts = append(con.resendPkts, spc)
+	con.resendPkts = append(con.resendPkts, rspc)
 
 	if con.pktTimeoutResenderIsRunning {
 		return nil
@@ -512,20 +507,19 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 				writeTimeout = con.handshakeTimeout
 			}
 			now := time.Now()
-			for _, spc := range con.resendPkts {
-				if now.Sub(spc.firstSendTime) > writeTimeout {
-					con.closeUS(errTimeout)
+			for _, rspc := range con.resendPkts {
+				if now.Sub(rspc.firstSendTime) > writeTimeout && con.tryCloseWhenTimeoutUS() {
 					con.mtx.Unlock()
 					return
 				}
-				diff := now.Sub(spc.lastSendTime)
-				if now.Sub(spc.lastSendTime) < con.minRTT {
+				diff := now.Sub(rspc.lastSendTime)
+				if diff < con.minRTT {
 					if diff < dur {
 						dur = diff
 					}
 					continue
 				}
-				err := con.resendUS(spc, 1)
+				err := con.resendUS(rspc, 1)
 				if err != nil {
 					con.mtx.Unlock()
 					return
@@ -548,6 +542,28 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 	defer con.mtx.Unlock()
 
 	return con.sendUS(typ, others...)
+}
+
+type resendPktCtx struct {
+	id            uint64
+	p             []byte
+	firstSendTime time.Time
+	lastSendTime  time.Time
+	sendCount     int64
+}
+
+func (con *Conn) resendUS(rspc *resendPktCtx, count int) error {
+	rspc.sendCount++
+	_, err := con.writeUS(rspc.p, count)
+	rspc.lastSendTime = con.lastWriteTime
+	return err
+}
+
+func (con *Conn) resend(rspc *resendPktCtx, count int) error {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	return con.resendUS(rspc, count)
 }
 
 func (con *Conn) flushUS() error {
@@ -585,6 +601,8 @@ func (con *Conn) Send(data []byte) error {
 	return con.send(pktData, data)
 }
 
+var errIntervalTooBrief = errors.New("gatling: Interval too brief.")
+
 func (con *Conn) Pace() error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
@@ -615,10 +633,10 @@ func (con *Conn) unresend(pktIDs ...uint64) {
 		}
 		isSent = true
 		isCached := false
-		for i, spc := range con.resendPkts {
-			if spc.id == pktID {
-				nowRTT := now.Sub(spc.firstSendTime)
-				con.updateRTTAndSPSCUS(nowRTT, spc.sendCount)
+		for i, rspc := range con.resendPkts {
+			if rspc.id == pktID {
+				nowRTT := now.Sub(rspc.firstSendTime)
+				con.updateRTTAndSPSCUS(nowRTT, rspc.sendCount)
 
 				if i == len(con.resendPkts)-1 {
 					con.resendPkts = con.resendPkts[:i]

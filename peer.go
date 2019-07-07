@@ -162,15 +162,16 @@ func ListenUDP(udpAddr *net.UDPAddr, portCount int, pcc PacketConnConverter) (*P
 				con.mtx.Lock()
 				defer con.mtx.Unlock()
 
-				endTime := con.lastReadTime.Add(con.readTimeout)
-				if now.Before(endTime) {
-					diff := endTime.Sub(now)
-					if diff < dur {
-						dur = diff
+				diff := now.Sub(con.lastReadTime)
+				if diff > con.readTimeout {
+					if con.tryCloseWhenTimeoutUS() {
+						return true
 					}
-					return true
+					diff = now.Sub(con.lastReadTime)
 				}
-				con.closeUS(errTimeout)
+				if diff < dur {
+					dur = diff
+				}
 				return true
 			})
 
@@ -198,9 +199,10 @@ func (pr *Peer) DialUDP(udpAddr *net.UDPAddr) (*Conn, error) {
 
 	con := newConn(pr, id)
 
-	ports, loaded := portsMap.Load(udpAddr.String())
-	if loaded {
-		con.setRmtAddrUS(udpAddr, ports.([]uint16)...)
+	hp := portsCache.Load(udpAddr.String())
+	if hp != nil {
+		con.rmtPortsHash = hp.hash
+		con.setRmtAddrUS(udpAddr, hp.ports...)
 	} else {
 		con.setRmtAddrUS(udpAddr)
 	}
