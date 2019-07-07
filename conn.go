@@ -23,9 +23,10 @@ type sendInfo struct {
 }
 
 type Conn struct {
-	id   uuid.UUID
-	lcPr *Peer
-	mtx  sync.Mutex
+	id           uuid.UUID
+	lcPr         *Peer
+	rmtPortsHash uint64
+	mtx          sync.Mutex
 
 	sendInfos  []*sendInfo
 	sendInfoIx uint
@@ -36,8 +37,12 @@ type Conn struct {
 
 	lastWriteTime time.Time
 	lastReadTime  time.Time
-	writeTimeout  time.Duration
-	readTimeout   time.Duration
+
+	handshakeTimeout time.Duration
+	isHandshaked     bool
+
+	writeTimeout time.Duration
+	readTimeout  time.Duration
 
 	sendPktIDCount uint64
 
@@ -72,10 +77,10 @@ type Conn struct {
 	rStrmMtx        sync.Mutex
 	rStrmCond       *sync.Cond
 
-	closeStatus byte
+	closeState byte
 }
 
-func newConn(id uuid.UUID, pr *Peer) *Conn {
+func newConn(pr *Peer, id uuid.UUID) *Conn {
 	pr.use()
 	now := time.Now()
 	con := &Conn{
@@ -85,6 +90,7 @@ func newConn(id uuid.UUID, pr *Peer) *Conn {
 		minRTT:                      DefaultRTT,
 		lastWriteTime:               now,
 		lastReadTime:                now,
+		handshakeTimeout:            10 * time.Second,
 		writeTimeout:                30 * time.Second,
 		readTimeout:                 90 * time.Second,
 		sentPktIDAppender:           newIDAppender(nil, nil),
@@ -98,18 +104,18 @@ var errIllegalAddr = errors.New("gatling: Illegal address.")
 var errTimeout = errors.New("gatling: Connection is timeout.")
 
 func (con *Conn) closeUS(recvErr error) error {
-	if con.closeStatus > 1 {
+	if con.closeState > 1 {
 		return nil
 	}
 	if recvErr == nil {
 		recvErr = errClosed
-		if con.closeStatus > 0 {
-			for con.closeStatus == 1 {
+		if con.closeState > 0 {
+			for con.closeState == 1 {
 				con.flushUS()
 			}
 			return nil
 		}
-		con.closeStatus = 1
+		con.closeState = 1
 		err := con.flushUS()
 		if err != nil {
 			return err
@@ -137,7 +143,7 @@ func (con *Conn) closeUS(recvErr error) error {
 	con.putRecvPkt(nil, recvErr)
 	con.putReadStrmPkt(0, nil, recvErr)
 
-	con.closeStatus = 2
+	con.closeState = 2
 	return nil
 }
 
@@ -156,17 +162,20 @@ func (con *Conn) IsClose() bool {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	return con.closeStatus > 0
+	return con.closeState > 0
 }
 
-func (con *Conn) setRmtAddr(mainAddr net.Addr, ports ...uint16) {
-	con.mtx.Lock()
-	defer con.mtx.Unlock()
-
+func (con *Conn) setRmtAddrUS(mainAddr net.Addr, ports ...uint16) {
 	mainUDPAddr := mainAddr.(*net.UDPAddr)
 	con.sendInfos = []*sendInfo{&sendInfo{mainUDPAddr, nil}}
 
+	if len(ports) == 0 {
+		con.rmtPortsHash = 0
+		return
+	}
+	con.rmtPortsHash = 1
 	for _, port := range ports {
+		con.rmtPortsHash = con.rmtPortsHash*hSeed + uint64(port)
 		if port == uint16(mainUDPAddr.Port) {
 			continue
 		}
@@ -178,13 +187,24 @@ func (con *Conn) setRmtAddr(mainAddr net.Addr, ports ...uint16) {
 	}
 }
 
-func (con *Conn) handleRecvInfo(from net.Addr, to net.PacketConn) {
+func (con *Conn) setRmtAddr(mainAddr net.Addr, ports ...uint16) {
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	con.setRmtAddrUS(mainAddr, ports...)
+}
+
+func (con *Conn) handleRecvInfo(from net.Addr, to net.PacketConn, h *header) {
 	udpAddr := from.(*net.UDPAddr)
 
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
 	con.lastReadTime = time.Now()
+
+	if !con.isHandshaked {
+		con.isHandshaked = true
+	}
 
 	for _, si := range con.sendInfos {
 		siUDPAddr := si.addr.(*net.UDPAddr)
@@ -196,6 +216,61 @@ func (con *Conn) handleRecvInfo(from net.Addr, to net.PacketConn) {
 		}
 	}
 	con.sendInfos = append(con.sendInfos, &sendInfo{from, to})
+}
+
+var errPortsHashMismatch = errors.New("gatling: ports hash mismatch.")
+
+func (con *Conn) handleRecvPacket(from net.Addr, to net.PacketConn, h *header, r *bytes.Buffer) {
+	if isReliableType[h.Type] && h.PktID > 0 {
+		con.send(pktReceiveds, h.PktID)
+		if !con.recvPktIDAppender.TryAdd(h.PktID, nil) {
+			return
+		}
+	}
+
+	switch h.Type {
+
+	case pktData:
+		fallthrough
+	case pktUnreliableData:
+		con.putRecvPkt(r.Bytes(), nil)
+
+	case pktReceiveds:
+		pktIDs := make([]uint64, r.Len()/8)
+		binary.Read(r, binary.LittleEndian, &pktIDs)
+		con.unresend(pktIDs...)
+
+	case pktRequests:
+
+	case pktUpdatePorts:
+		ports := make([]uint16, r.Len()/2)
+		binary.Read(r, binary.LittleEndian, &ports)
+
+		con.mtx.Lock()
+
+		con.setRmtAddrUS(from, ports...)
+		if con.rmtPortsHash != h.SrcPortsHash {
+			con.close(errPortsHashMismatch)
+			return
+		}
+
+		rmtAddr := con.sendInfos[0].addr.String()
+
+		con.mtx.Unlock()
+
+		portsMap.Store(rmtAddr, ports)
+
+	case pktClosed:
+		fallthrough
+
+	case pktInvalid:
+		con.close(errClosed)
+
+	case pktStreamData:
+		var strmPktIx uint64
+		binary.Read(r, binary.LittleEndian, &strmPktIx)
+		con.putReadStrmPkt(strmPktIx, r.Bytes(), nil)
+	}
 }
 
 var errRmtAddrLoss = errors.New("gatling: Remote address loss.")
@@ -268,7 +343,7 @@ func (con *Conn) SetReadDeadline(t time.Time) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	if con.closeStatus > 0 {
+	if con.closeState > 0 {
 		return errClosed
 	}
 	con.readTimeout = t.Sub(time.Now())
@@ -279,7 +354,7 @@ func (con *Conn) SetWriteDeadline(t time.Time) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	if con.closeStatus > 0 {
+	if con.closeState > 0 {
 		return errClosed
 	}
 	con.writeTimeout = t.Sub(time.Now())
@@ -290,7 +365,7 @@ func (con *Conn) SetDeadline(t time.Time) error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
-	if con.closeStatus > 0 {
+	if con.closeState > 0 {
 		return errClosed
 	}
 	dur := t.Sub(time.Now())
@@ -300,7 +375,7 @@ func (con *Conn) SetDeadline(t time.Time) error {
 }
 
 func (con *Conn) writeUS(b []byte, count int) (int, error) {
-	if con.closeStatus > 1 {
+	if con.closeState > 1 {
 		return 0, errClosed
 	}
 
@@ -361,9 +436,11 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	}
 
 	h := header{
-		ID:    con.id,
-		PktID: con.sendPktIDCount,
-		Type:  typ,
+		SrcPortsHash:  con.lcPr.lnPortsHash,
+		DestPortsHash: con.rmtPortsHash,
+		ID:            con.id,
+		PktID:         con.sendPktIDCount,
+		Type:          typ,
 	}
 	p := makePacket(&h, others...)
 
@@ -384,7 +461,7 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 	}
 
 	for {
-		if con.closeStatus > 1 {
+		if con.closeState > 1 {
 			if con.resendPktErr != nil {
 				return con.resendPktErr
 			}
@@ -429,9 +506,13 @@ func (con *Conn) sendUS(typ byte, others ...interface{}) error {
 
 			dur := con.minRTT
 
+			writeTimeout := con.writeTimeout
+			if !con.isHandshaked && con.handshakeTimeout < con.writeTimeout {
+				writeTimeout = con.handshakeTimeout
+			}
 			now := time.Now()
 			for _, spc := range con.resendPkts {
-				if now.Sub(spc.firstSendTime) > con.writeTimeout {
+				if now.Sub(spc.firstSendTime) > writeTimeout {
 					con.closeUS(errTimeout)
 					con.mtx.Unlock()
 					return
@@ -470,7 +551,7 @@ func (con *Conn) send(typ byte, others ...interface{}) error {
 
 func (con *Conn) flushUS() error {
 	for {
-		if con.closeStatus > 1 {
+		if con.closeState > 1 {
 			if con.resendPktErr != nil {
 				return con.resendPktErr
 			}
@@ -488,7 +569,7 @@ func (con *Conn) flushUS() error {
 	}
 }
 
-func (con *Conn) flush() error {
+func (con *Conn) Flush() error {
 	con.mtx.Lock()
 	defer con.mtx.Unlock()
 
@@ -609,60 +690,6 @@ func (con *Conn) unresend(pktIDs ...uint64) {
 }
 
 var errClosed = errors.New("gatling: Connection is closed.")
-
-func (con *Conn) handleRecvPacket(from net.Addr, h *header, r *bytes.Buffer) {
-	if isReliableType[h.Type] && h.PktID > 0 {
-		if h.Type == pktRequestPorts {
-			con.send(pktResponsePorts, h.PktID, con.lcPr.lnPorts)
-			con.recvPktIDAppender.TryAdd(h.PktID, nil)
-			return
-		}
-		con.send(pktReceiveds, h.PktID)
-		if !con.recvPktIDAppender.TryAdd(h.PktID, nil) {
-			return
-		}
-	}
-
-	switch h.Type {
-
-	case pktData:
-		fallthrough
-	case pktUnreliableData:
-		con.putRecvPkt(r.Bytes(), nil)
-
-	case pktReceiveds:
-		pktIDs := make([]uint64, r.Len()/8)
-		binary.Read(r, binary.LittleEndian, &pktIDs)
-		con.unresend(pktIDs...)
-
-	case pktRequests:
-
-	case pktResponsePorts:
-		var reqPrtsPktID uint64
-		binary.Read(r, binary.LittleEndian, &reqPrtsPktID)
-		con.unresend(reqPrtsPktID)
-
-		ports := make([]uint16, r.Len()/2)
-		binary.Read(r, binary.LittleEndian, &ports)
-		con.setRmtAddr(from, ports...)
-
-	case pktUpdatePorts:
-		ports := make([]uint16, r.Len()/2)
-		binary.Read(r, binary.LittleEndian, &ports)
-		con.setRmtAddr(from, ports...)
-
-	case pktClosed:
-		fallthrough
-
-	case pktInvalid:
-		con.close(errClosed)
-
-	case pktStreamData:
-		var strmPktIx uint64
-		binary.Read(r, binary.LittleEndian, &strmPktIx)
-		con.putReadStrmPkt(strmPktIx, r.Bytes(), nil)
-	}
-}
 
 func (con *Conn) putRecvPkt(data []byte, err error) {
 	con.recvPktMtx.Lock()

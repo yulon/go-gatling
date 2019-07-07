@@ -14,8 +14,6 @@ const (
 	pktData
 	pktReceiveds
 	pktRequests
-	pktRequestPorts
-	pktResponsePorts
 	pktUpdatePorts
 	pktClosed
 	pktInvalid
@@ -28,8 +26,6 @@ var isReliableType = []bool{
 	true,  // pktData
 	false, // pktReceiveds
 	false, // pktRequests
-	true,  // pktRequestPorts
-	false, // pktResponsePorts
 	true,  // pktUpdatePorts
 	true,  // pktClosed
 	false, // pktInvalid
@@ -38,9 +34,11 @@ var isReliableType = []bool{
 }
 
 type header struct {
-	ID    uuid.UUID
-	PktID uint64
-	Type  byte
+	SrcPortsHash  uint64
+	DestPortsHash uint64
+	ID            uuid.UUID
+	PktID         uint64
+	Type          byte
 }
 
 var headerSz = binary.Size(&header{})
@@ -48,6 +46,8 @@ var headerSz = binary.Size(&header{})
 const resendPktsMax = 1024
 
 const DefaultRTT = 266 * time.Millisecond
+
+var portsMap sync.Map
 
 func makeData(others ...interface{}) []byte {
 	buf := bytes.NewBuffer([]byte{})
@@ -171,4 +171,14 @@ func (ida *idAppender) Has(id uint64) bool {
 		}
 	}
 	return false
+}
+
+const hSeed uint64 = 131
+
+func hashU16(vals []uint16) (h uint64) {
+	h = 1
+	for _, val := range vals {
+		h = h*hSeed + uint64(val)
+	}
+	return
 }

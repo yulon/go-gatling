@@ -12,13 +12,14 @@ import (
 )
 
 type Peer struct {
-	lnPorts  []uint16
-	pktLnrs  []net.PacketConn
-	lnPtr    uint
-	mtx      sync.Mutex
-	conMap   sync.Map
-	acptCh   chan *Conn
-	useCount int64
+	pktLnrs     []net.PacketConn
+	lnPorts     []uint16
+	lnPortsHash uint64
+	lnIx        uint
+	mtx         sync.Mutex
+	conMap      sync.Map
+	acptCh      chan *Conn
+	useCount    int64
 }
 
 func (pr *Peer) use() {
@@ -41,8 +42,8 @@ func (pr *Peer) writeTo(p []byte, addr net.Addr, count int) (sz int, err error) 
 	}
 
 	for i := 0; i < count; i++ {
-		pr.lnPtr++
-		ix := int(pr.lnPtr % uint(len(pr.pktLnrs)))
+		pr.lnIx++
+		ix := int(pr.lnIx % uint(len(pr.pktLnrs)))
 		sz, err = pr.pktLnrs[ix].WriteTo(p, addr)
 		if err != nil {
 			return
@@ -51,37 +52,54 @@ func (pr *Peer) writeTo(p []byte, addr net.Addr, count int) (sz int, err error) 
 	return
 }
 
-func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, p []byte) {
+func (pr *Peer) bypassRecvPacket(from net.Addr, to net.PacketConn, h *header, p []byte) {
 	r := bytes.NewBuffer(p)
-	var h header
-	err := binary.Read(r, binary.LittleEndian, &h)
-	if err != nil {
+	err := binary.Read(r, binary.LittleEndian, h)
+
+	if err != nil || int(h.Type) >= len(isReliableType) {
 		return
 	}
+
+	if h.DestPortsHash == 0 {
+		if to.LocalAddr().(*net.UDPAddr).Port != int(pr.lnPorts[0]) {
+			return
+		}
+	} else if h.DestPortsHash != pr.lnPortsHash {
+		return
+	}
+
 	var con *Conn
 	v, ok := pr.conMap.Load(h.ID)
-	if !ok {
-		con = newConn(h.ID, pr)
-		con.handleRecvInfo(from, to)
+	if ok {
+		con = v.(*Conn)
+		con.handleRecvInfo(from, to, h)
+	} else {
+		con = newConn(pr, h.ID)
+		con.rmtPortsHash = h.SrcPortsHash
+		con.isHandshaked = true
+		con.handleRecvInfo(from, to, h)
 
 		actual, loaded := pr.conMap.LoadOrStore(h.ID, con)
-		if !loaded {
-			if h.Type != pktRequestPorts || h.PktID != 1 {
-				h.Type = pktInvalid
-				h.PktID = 0
-				to.WriteTo(makePacket(&h), from)
-				con.closeUS(errClosed)
+		if loaded {
+			con = actual.(*Conn)
+			con.handleRecvInfo(from, to, h)
+		} else {
+			if h.DestPortsHash == 0 && len(pr.lnPorts) > 1 {
+				err := con.send(pktUpdatePorts, pr.lnPorts)
+				if err != nil {
+					return
+				}
+			}
+			pr.mtx.Lock()
+			if len(pr.pktLnrs) == 0 {
+				pr.mtx.Unlock()
 				return
 			}
 			pr.acptCh <- con
-			return
+			pr.mtx.Unlock()
 		}
-		con = actual.(*Conn)
-	} else {
-		con = v.(*Conn)
-		con.handleRecvInfo(from, to)
 	}
-	con.handleRecvPacket(from, &h, r)
+	con.handleRecvPacket(from, to, h, r)
 	return
 }
 
@@ -89,7 +107,8 @@ type PacketConnConverter func(net.PacketConn) net.PacketConn
 
 func ListenUDP(udpAddr *net.UDPAddr, portCount int, pcc PacketConnConverter) (*Peer, error) {
 	pr := &Peer{
-		acptCh: make(chan *Conn, 1),
+		acptCh:      make(chan *Conn, 1),
+		lnPortsHash: 1,
 	}
 
 	for i := 0; i < portCount; i++ {
@@ -113,18 +132,21 @@ func ListenUDP(udpAddr *net.UDPAddr, portCount int, pcc PacketConnConverter) (*P
 		}
 
 		go func() {
+			var h header
 			b := make([]byte, 1280)
 			for {
 				sz, addr, err := pktLnr.ReadFrom(b)
 				if err != nil {
 					return
 				}
-				pr.bypassRecvPacket(addr, pktLnr, b[:sz])
+				pr.bypassRecvPacket(addr, pktLnr, &h, b[:sz])
 			}
 		}()
 
 		pr.pktLnrs = append(pr.pktLnrs, pktLnr)
-		pr.lnPorts = append(pr.lnPorts, uint16(pktLnr.LocalAddr().(*net.UDPAddr).Port))
+		port := pktLnr.LocalAddr().(*net.UDPAddr).Port
+		pr.lnPortsHash = pr.lnPortsHash*hSeed + uint64(port)
+		pr.lnPorts = append(pr.lnPorts, uint16(port))
 	}
 
 	go func() {
@@ -171,22 +193,16 @@ func (pr *Peer) DialUDP(udpAddr *net.UDPAddr) (*Conn, error) {
 		return nil, err
 	}
 
-	con := newConn(id, pr)
-	con.setRmtAddr(udpAddr)
-	con.SetWriteTimeout(5 * time.Second)
+	con := newConn(pr, id)
+
+	ports, loaded := portsMap.Load(udpAddr.String())
+	if loaded {
+		con.setRmtAddrUS(udpAddr, ports.([]uint16)...)
+	} else {
+		con.setRmtAddrUS(udpAddr)
+	}
 
 	pr.conMap.Store(id, con)
-
-	err = con.send(pktRequestPorts)
-	if err != nil {
-		return nil, err
-	}
-
-	err = con.flush()
-	if err != nil {
-		return nil, err
-	}
-	con.SetWriteTimeout(30 * time.Second)
 	return con, nil
 }
 
@@ -232,15 +248,6 @@ func (pr *Peer) AcceptGatling() (*Conn, error) {
 	if !ok || con.IsClose() {
 		return nil, errClosed
 	}
-	con.handleRecvPacket(
-		nil,
-		&header{
-			con.id,
-			1,
-			pktRequestPorts,
-		},
-		nil,
-	)
 	return con, nil
 }
 
