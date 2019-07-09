@@ -66,15 +66,10 @@ func (hpm *hashedPortsMap) Store(addrStr string, portsHash uint64, ports []uint1
 	defer hpm.mtx.Unlock()
 
 	pwh, loaded := hpm.mp[addrStr]
-	if !loaded {
-		hpm.mp[addrStr] = &hashedPorts{portsHash, ports}
+	if loaded && pwh.hash == portsHash {
 		return
 	}
-	if pwh.hash == portsHash {
-		return
-	}
-	pwh.hash = portsHash
-	pwh.ports = ports
+	hpm.mp[addrStr] = &hashedPorts{portsHash, ports}
 }
 
 func (hpm *hashedPortsMap) Load(addrStr string) *hashedPorts {
@@ -89,10 +84,7 @@ func (hpm *hashedPortsMap) Delete(addrStr string, portsHash uint64) {
 	defer hpm.mtx.Unlock()
 
 	pwh, loaded := hpm.mp[addrStr]
-	if !loaded {
-		return
-	}
-	if pwh.hash != portsHash {
+	if !loaded || pwh.hash != portsHash {
 		return
 	}
 	delete(hpm.mp, addrStr)
