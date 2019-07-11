@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -31,8 +30,8 @@ type Conn struct {
 	sendInfos  []*sendInfo
 	sendInfoIx uint
 
-	nowRTT              int64
-	nowSentPktSendCount int64
+	nowRTT              time.Duration
+	nowSentPktSendCount int
 	minRTT              time.Duration
 
 	lastWriteTime time.Time
@@ -86,7 +85,7 @@ func newConn(pr *Peer, id uuid.UUID) *Conn {
 	con := &Conn{
 		id:                          id,
 		lcPr:                        pr,
-		nowRTT:                      int64(DefaultRTT),
+		nowRTT:                      DefaultRTT,
 		minRTT:                      DefaultRTT,
 		lastWriteTime:               now,
 		lastReadTime:                now,
@@ -314,11 +313,17 @@ func (con *Conn) ID() uuid.UUID {
 }
 
 func (con *Conn) RTT() time.Duration {
-	return time.Duration(atomic.LoadInt64(&con.nowRTT))
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	return con.nowRTT
 }
 
 func (con *Conn) PacketLoss() float32 {
-	return float32(1) - float32(1)/float32(atomic.LoadInt64(&con.nowSentPktSendCount))
+	con.mtx.Lock()
+	defer con.mtx.Unlock()
+
+	return float32(1) - float32(1)/float32(con.nowSentPktSendCount)
 }
 
 func (con *Conn) LastReadTime() time.Time {
@@ -549,7 +554,7 @@ type resendPktCtx struct {
 	p             []byte
 	firstSendTime time.Time
 	lastSendTime  time.Time
-	sendCount     int64
+	sendCount     int
 }
 
 func (con *Conn) resendUS(rspc *resendPktCtx, count int) error {
@@ -613,9 +618,9 @@ func (con *Conn) Pace() error {
 	return con.sendUS(pktHeartbeat)
 }
 
-func (con *Conn) updateRTTAndSPSCUS(rtt time.Duration, sentPktSendCount int64) {
-	atomic.StoreInt64(&con.nowRTT, int64(rtt))
-	atomic.StoreInt64(&con.nowSentPktSendCount, sentPktSendCount)
+func (con *Conn) updateRTTAndSPSCUS(rtt time.Duration, sentPktSendCount int) {
+	con.nowRTT = rtt
+	con.nowSentPktSendCount = sentPktSendCount
 	if rtt < con.minRTT {
 		con.minRTT = rtt
 	}
